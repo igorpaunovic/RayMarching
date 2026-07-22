@@ -1,0 +1,39 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(RayMarching LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_subdirectory(external/glfw)
+
+add_executable(RayMarching
+    src/main.cpp
+    src/glad.c
+)
+
+target_include_directories(RayMarching
+    PRIVATE
+        include
+)
+
+target_link_libraries(RayMarching
+    PRIVATE
+        glfw
+        opengl32
+)
+
+target_sources(RayMarching
+    PRIVATE
+        assets/shaders/basic.glsl
+        assets/shaders/basic.frag
+)
+
+add_custom_command(
+    TARGET RayMarching POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets"
+        "$<TARGET_FILE_DIR:RayMarching>/assets"
+    COMMENT "Copying assets to output directory"
+)
