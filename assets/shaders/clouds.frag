@@ -19,6 +19,11 @@ const float MAX_DISTANCE = 300.0;
 
 const vec3 SUN_DIR = normalize(vec3(0.6, 0.3, -0.7));
 
+// Menu-controlled effects: "shadows" is the cloud self-shading sample,
+// "fog" the aerial dissolve of distant clouds into the sky.
+uniform bool uEnableShadows = true;
+uniform bool uEnableFog     = true;
+
 // ---------------------------------------------------------------------------
 // Value noise and fractal Brownian motion
 // ---------------------------------------------------------------------------
@@ -141,8 +146,13 @@ vec4 marchClouds(vec3 ro, vec3 rd, vec3 bg)
 
         if (den > 0.01)
         {
-            float sunward = cloudDensity(pos + SUN_DIR * 5.0);
-            float dif = clamp((den - sunward) * 1.6, 0.0, 1.0);
+            // Self-shading; a flat mid value when disabled.
+            float dif = 0.25;
+            if (uEnableShadows)
+            {
+                float sunward = cloudDensity(pos + SUN_DIR * 5.0);
+                dif = clamp((den - sunward) * 1.6, 0.0, 1.0);
+            }
 
             // Ambient sky light plus warm directional sun.
             vec3 lin = vec3(0.62, 0.68, 0.80) * 1.15
@@ -158,7 +168,8 @@ vec4 marchClouds(vec3 ro, vec3 rd, vec3 bg)
             vec4 col = vec4(cloudColor * lin, den);
 
             // Distant clouds dissolve into the sky for aerial depth.
-            col.rgb = mix(col.rgb, bg, 1.0 - exp(-0.003 * t));
+            if (uEnableFog)
+                col.rgb = mix(col.rgb, bg, 1.0 - exp(-0.003 * t));
 
             // Premultiply and accumulate front-to-back.
             col.a *= 0.42;

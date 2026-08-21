@@ -140,7 +140,9 @@ vec3 shade(vec3 ro, vec3 rd, float t, float mat)
 
     float diffuse = max(dot(n, lightDir), 0.0);
     vec3 halfway = normalize(lightDir - rd);
-    float specular = pow(max(dot(n, halfway), 0.0), 48.0);
+    float specular = uEnableSpecular
+        ? pow(max(dot(n, halfway), 0.0), 48.0)
+        : 0.0;
 
     float shadow = softShadow(p + n * 0.01, lightDir, 0.02, 12.0, 12.0);
     float ao = ambientOcclusion(p, n);

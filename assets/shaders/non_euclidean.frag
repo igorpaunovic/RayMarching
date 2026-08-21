@@ -16,6 +16,12 @@ uniform float uTime;       // seconds since startup
 uniform vec3  uCamPos;     // camera position, world space
 uniform mat3  uCamRot;     // camera basis: columns = (right, up, forward)
 
+// Menu-controlled effects.
+uniform float uCurveScale     = 1.0; // 0 = straight (Euclidean) rays
+uniform bool  uEnableAO       = true;
+uniform bool  uEnableSpecular = true;
+uniform bool  uEnableFog      = true;
+
 const float FOCAL_LENGTH = 1.5; // ~67 degrees vertical FOV
 const int   MAX_STEPS    = 200;
 const float MAX_DISTANCE = 120.0;
@@ -99,7 +105,9 @@ float rayMarch(vec3 ro, vec3 rd, out vec3 pos, out vec3 dir)
         t += stepLen;
 
         // Curve the ray through the sinusoidal field.
-        dir = normalize(dir + bendField(pos) * CURVE_STRENGTH * stepLen);
+        dir = normalize(
+            dir + bendField(pos) * (CURVE_STRENGTH * uCurveScale) * stepLen
+        );
 
         if (t > MAX_DISTANCE)
             break;
@@ -121,6 +129,9 @@ vec3 calcNormal(vec3 p)
 
 float ambientOcclusion(vec3 p, vec3 n)
 {
+    if (!uEnableAO)
+        return 1.0;
+
     float occlusion = 0.0;
     float weight = 1.0;
 
@@ -178,7 +189,9 @@ vec3 shade(vec3 p, vec3 rd, float t)
     vec3 lightDir = normalize(vec3(0.5, 0.8, -0.3));
     float diffuse = max(dot(n, lightDir), 0.0);
     vec3 halfway = normalize(lightDir - rd);
-    float specular = pow(max(dot(n, halfway), 0.0), 32.0);
+    float specular = uEnableSpecular
+        ? pow(max(dot(n, halfway), 0.0), 32.0)
+        : 0.0;
 
     float ao = ambientOcclusion(p, n);
 
@@ -192,6 +205,9 @@ vec3 shade(vec3 p, vec3 rd, float t)
     color += albedo * rim * 0.6;
 
     // Fog into the void; far tori dissolve into darkness.
+    if (!uEnableFog)
+        return color;
+
     float fog = 1.0 - exp(-0.030 * t);
     return mix(color, skyColor(rd), fog);
 }

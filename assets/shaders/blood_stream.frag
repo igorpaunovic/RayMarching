@@ -16,6 +16,12 @@ uniform float uTime;       // seconds since startup
 uniform vec3  uCamPos;     // camera position, world space
 uniform mat3  uCamRot;     // camera basis: columns = (right, up, forward)
 
+// Menu-controlled effects.
+uniform float uCurveScale     = 1.0; // 0 = straight (Euclidean) rays
+uniform bool  uEnableAO       = true;
+uniform bool  uEnableSpecular = true;
+uniform bool  uEnableFog      = true;
+
 const float FOCAL_LENGTH = 1.5; // ~67 degrees vertical FOV
 const int   MAX_STEPS    = 200;
 const float MAX_DISTANCE = 90.0;
@@ -260,7 +266,9 @@ float rayMarch(vec3 ro, vec3 rd, out vec3 pos, out vec3 dir)
         pos += dir * stepLen;
         t += stepLen;
 
-        dir = normalize(dir + bendField(pos) * CURVE_STRENGTH * stepLen);
+        dir = normalize(
+            dir + bendField(pos) * (CURVE_STRENGTH * uCurveScale) * stepLen
+        );
 
         if (t > MAX_DISTANCE)
             break;
@@ -281,6 +289,9 @@ vec3 calcNormal(vec3 p)
 
 float ambientOcclusion(vec3 p, vec3 n)
 {
+    if (!uEnableAO)
+        return 1.0;
+
     float occlusion = 0.0;
     float weight = 1.0;
 
@@ -327,7 +338,9 @@ vec3 shade(vec3 p, vec3 rd, float t, float mat)
     float diffuse = pow(wrap, 1.5);
 
     // Broad wet-membrane sheen rather than a hard plastic highlight.
-    float specular = pow(max(dot(n, lightDir), 0.0), 12.0);
+    float specular = uEnableSpecular
+        ? pow(max(dot(n, lightDir), 0.0), 12.0)
+        : 0.0;
 
     // Transmission: thin translucent cells glow at grazing angles as
     // light passes through their rims (strongest on red cells).
@@ -346,6 +359,9 @@ vec3 shade(vec3 p, vec3 rd, float t, float mat)
     color *= 1.0 + 0.10 * heartbeat();
 
     // Dense plasma fog: distance drowns everything in deep red.
+    if (!uEnableFog)
+        return color;
+
     float fog = 1.0 - exp(-0.055 * t);
     return mix(color, plasmaColor(), fog);
 }

@@ -19,6 +19,13 @@ uniform float uTime;       // seconds since startup
 uniform vec3  uCamPos;     // camera position, world space
 uniform mat3  uCamRot;     // camera basis: columns = (right, up, forward)
 
+// Menu-controlled effect toggles (initializers keep the shader fully
+// functional even if the application never sets them).
+uniform bool uEnableShadows  = true;
+uniform bool uEnableAO       = true;
+uniform bool uEnableSpecular = true;
+uniform bool uEnableFog      = true;
+
 // ---------------------------------------------------------------------------
 // Tunables and their defaults
 // ---------------------------------------------------------------------------
@@ -163,6 +170,9 @@ vec3 calcNormal(vec3 p, float t)
 // cone approximation). k controls penumbra sharpness.
 float softShadow(vec3 ro, vec3 rd, float tMin, float tMax, float k)
 {
+    if (!uEnableShadows)
+        return 1.0;
+
     float result = 1.0;
     float t = tMin;
 
@@ -187,6 +197,9 @@ float softShadow(vec3 ro, vec3 rd, float tMin, float tMax, float k)
 // distance field grows slower than the sample offset, geometry is near.
 float ambientOcclusion(vec3 p, vec3 n)
 {
+    if (!uEnableAO)
+        return 1.0;
+
     float occlusion = 0.0;
     float weight = 1.0;
 
@@ -208,6 +221,9 @@ float ambientOcclusion(vec3 p, vec3 n)
 // Exponential (Beer-Lambert) distance fog toward a haze color.
 vec3 applyFog(vec3 color, vec3 haze, float t)
 {
+    if (!uEnableFog)
+        return color;
+
     float fog = 1.0 - exp(-FOG_DENSITY * t);
     return mix(color, haze, fog);
 }

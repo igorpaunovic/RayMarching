@@ -105,7 +105,9 @@ vec3 shade(vec3 ro, vec3 rd, float t, float mat)
     // Blinn-Phong terms.
     float diffuse = max(dot(n, lightDir), 0.0);
     vec3 halfway = normalize(lightDir - rd);
-    float specular = pow(max(dot(n, halfway), 0.0), 32.0);
+    float specular = uEnableSpecular
+        ? pow(max(dot(n, halfway), 0.0), 32.0)
+        : 0.0;
 
     // SDF-native effects.
     float shadow = softShadow(p + n * 0.02, lightDir, 0.02, 20.0, 8.0);

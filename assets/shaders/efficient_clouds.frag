@@ -23,6 +23,11 @@ const float MAX_DISTANCE = 300.0;
 
 const vec3 SUN_DIR = normalize(vec3(0.6, 0.3, -0.7));
 
+// Menu-controlled effects: "shadows" is the cloud self-shading sample,
+// "fog" the aerial dissolve of distant clouds into the sky.
+uniform bool uEnableShadows = true;
+uniform bool uEnableFog     = true;
+
 // Cloud band extents (slightly padded past the density smoothsteps so
 // the soft edges are not clipped).
 const float CUMULUS_MIN = -78.0;
@@ -194,9 +199,14 @@ void marchInterval(vec3 ro, vec3 rd, vec2 range, vec3 bg, inout vec4 sum)
         if (den > 0.01)
         {
             // Sunward sample only feeds a soft lighting term; low
-            // detail is indistinguishable there.
-            float sunward = cloudDensity(pos + SUN_DIR * 5.0, 3);
-            float dif = clamp((den - sunward) * 1.6, 0.0, 1.0);
+            // detail is indistinguishable there. Flat value when
+            // self-shading is disabled (also skips the extra sample).
+            float dif = 0.25;
+            if (uEnableShadows)
+            {
+                float sunward = cloudDensity(pos + SUN_DIR * 5.0, 3);
+                dif = clamp((den - sunward) * 1.6, 0.0, 1.0);
+            }
 
             // Ambient sky light plus warm directional sun.
             vec3 lin = vec3(0.62, 0.68, 0.80) * 1.15
@@ -212,7 +222,8 @@ void marchInterval(vec3 ro, vec3 rd, vec2 range, vec3 bg, inout vec4 sum)
             vec4 col = vec4(cloudColor * lin, den);
 
             // Distant clouds dissolve into the sky for aerial depth.
-            col.rgb = mix(col.rgb, bg, 1.0 - exp(-0.003 * t));
+            if (uEnableFog)
+                col.rgb = mix(col.rgb, bg, 1.0 - exp(-0.003 * t));
 
             // Premultiply and accumulate front-to-back.
             col.a *= 0.42;

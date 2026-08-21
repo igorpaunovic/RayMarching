@@ -335,13 +335,21 @@ unsigned int create_shader_program(
     return program;
 }
 
-// Uniform locations for the ray marching shader.
+// Uniform locations for the ray marching shader. Effect uniforms are
+// optional per shader; a location of -1 (absent) is silently ignored
+// by glUniform*.
 struct Uniforms
 {
     int resolution = -1;
     int time = -1;
     int cam_pos = -1;
     int cam_rot = -1;
+
+    int enable_shadows = -1;
+    int enable_ao = -1;
+    int enable_specular = -1;
+    int enable_fog = -1;
+    int curve_scale = -1;
 };
 
 Uniforms query_uniforms(unsigned int program)
@@ -351,8 +359,25 @@ Uniforms query_uniforms(unsigned int program)
     u.time = glGetUniformLocation(program, "uTime");
     u.cam_pos = glGetUniformLocation(program, "uCamPos");
     u.cam_rot = glGetUniformLocation(program, "uCamRot");
+
+    u.enable_shadows = glGetUniformLocation(program, "uEnableShadows");
+    u.enable_ao = glGetUniformLocation(program, "uEnableAO");
+    u.enable_specular = glGetUniformLocation(program, "uEnableSpecular");
+    u.enable_fog = glGetUniformLocation(program, "uEnableFog");
+    u.curve_scale = glGetUniformLocation(program, "uCurveScale");
     return u;
 }
+
+// Menu-controlled rendering effects, applied to any shader that
+// declares the matching uniform.
+struct Effects
+{
+    bool shadows = true;
+    bool ao = true;
+    bool specular = true;
+    bool fog = true;
+    float curve_scale = 1.0f; // 0 = Euclidean, 1 = world default
+};
 
 // Lists all .frag files in the given directory (sorted), so new world
 // shaders show up in the menu without code changes.
@@ -503,6 +528,7 @@ int main(int argc, char** argv)
     }
 
     Uniforms uniforms = query_uniforms(shader_program);
+    Effects effects;
 
     // Compiles the given fragment shader and swaps it in on success;
     // on failure the current program keeps running.
@@ -671,6 +697,22 @@ int main(int argc, char** argv)
             if (ImGui::Button("Reload"))
                 load_fragment(current_fragment);
 
+            // Effect toggles; worlds that lack the matching uniform
+            // simply ignore them.
+            ImGui::Separator();
+            ImGui::TextDisabled("Effects");
+            ImGui::Checkbox("Shadows", &effects.shadows);
+            ImGui::Checkbox("Ambient occlusion", &effects.ao);
+            ImGui::Checkbox("Specular", &effects.specular);
+            ImGui::Checkbox("Fog", &effects.fog);
+            ImGui::SliderFloat(
+                "Curvature",
+                &effects.curve_scale,
+                0.0f,
+                2.0f,
+                "%.2f"
+            );
+
             ImGui::TextDisabled("Tab closes the menu. R reloads.");
             ImGui::End();
         }
@@ -687,6 +729,12 @@ int main(int argc, char** argv)
         );
         glUniform1f(uniforms.time, static_cast<float>(now));
         glUniform3f(uniforms.cam_pos, g_camera.x, g_camera.y, g_camera.z);
+
+        glUniform1i(uniforms.enable_shadows, effects.shadows ? 1 : 0);
+        glUniform1i(uniforms.enable_ao, effects.ao ? 1 : 0);
+        glUniform1i(uniforms.enable_specular, effects.specular ? 1 : 0);
+        glUniform1i(uniforms.enable_fog, effects.fog ? 1 : 0);
+        glUniform1f(uniforms.curve_scale, effects.curve_scale);
 
         float basis[9];
         camera_basis(g_camera, basis);
