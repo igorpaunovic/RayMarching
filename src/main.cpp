@@ -1,12 +1,19 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -37,6 +44,10 @@ static double g_last_cursor_x = 0.0;
 static double g_last_cursor_y = 0.0;
 static bool g_first_cursor_event = true;
 
+// When true the cursor is released and the ImGui menu is shown;
+// camera input (mouse-look and WASD) is suspended.
+static bool g_menu_open = false;
+
 // ---------------------------------------------------------------------------
 // GLFW callbacks
 // ---------------------------------------------------------------------------
@@ -50,6 +61,9 @@ void framebuffer_size_callback(GLFWwindow*, int width, int height)
 
 void cursor_pos_callback(GLFWwindow*, double xpos, double ypos)
 {
+    if (g_menu_open)
+        return;
+
     if (g_first_cursor_event)
     {
         g_last_cursor_x = xpos;
@@ -116,6 +130,10 @@ void process_input(GLFWwindow* window, float delta_time)
 {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
+
+    // While the menu is open the keyboard belongs to the UI.
+    if (g_menu_open)
+        return;
 
     float speed = 4.0f * delta_time;
     if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
@@ -278,6 +296,27 @@ Uniforms query_uniforms(unsigned int program)
     return u;
 }
 
+// Lists all .frag files in the given directory (sorted), so new world
+// shaders show up in the menu without code changes.
+std::vector<std::string> list_fragment_shaders(const char* directory)
+{
+    std::vector<std::string> files;
+
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory, ec))
+    {
+        if (entry.is_regular_file()
+            && entry.path().extension() == ".frag")
+        {
+            files.push_back(entry.path().generic_string());
+        }
+    }
+
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -351,6 +390,15 @@ int main()
 
     glfwSetCursorPosCallback(window, cursor_pos_callback);
 
+    // Dear ImGui setup. Installing callbacks after ours are registered
+    // lets the backend chain to them instead of replacing them.
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr; // no imgui.ini clutter
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
     std::cout
         << "OpenGL version: "
         << reinterpret_cast<const char*>(glGetString(GL_VERSION))
@@ -374,11 +422,15 @@ int main()
         << '\n';
 
     const char* vertex_path = "assets/shaders/basic.glsl";
-    const char* fragment_path = "assets/shaders/raymarch.frag";
+    const char* shader_directory = "assets/shaders";
+
+    std::string current_fragment = "assets/shaders/raymarch.frag";
+    std::vector<std::string> shader_files =
+        list_fragment_shaders(shader_directory);
 
     unsigned int shader_program = create_shader_program(
         vertex_path,
-        fragment_path
+        current_fragment.c_str()
     );
 
     if (shader_program == 0)
@@ -389,6 +441,29 @@ int main()
     }
 
     Uniforms uniforms = query_uniforms(shader_program);
+
+    // Compiles the given fragment shader and swaps it in on success;
+    // on failure the current program keeps running.
+    auto load_fragment = [&](const std::string& fragment_path) -> bool
+    {
+        const unsigned int new_program = create_shader_program(
+            vertex_path,
+            fragment_path.c_str()
+        );
+
+        if (new_program == 0)
+        {
+            std::cerr
+                << "Shader load failed; keeping previous program.\n";
+            return false;
+        }
+
+        glDeleteProgram(shader_program);
+        shader_program = new_program;
+        uniforms = query_uniforms(shader_program);
+        current_fragment = fragment_path;
+        return true;
+    };
 
     // Full-screen quad in normalized device coordinates
     // (two triangles covering [-1, 1] x [-1, 1]).
@@ -431,8 +506,9 @@ int main()
     double fps_timer = last_frame_time;
     int fps_frame_count = 0;
 
-    // Edge detection for the hot-reload key.
+    // Edge detection for the hot-reload and menu toggle keys.
     bool reload_key_was_down = false;
+    bool menu_key_was_down = false;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -442,6 +518,29 @@ int main()
 
         process_input(window, delta_time);
 
+        // Tab toggles the menu: release the cursor for the UI, or
+        // recapture it for mouse-look.
+        const bool menu_key_down =
+            glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
+
+        if (menu_key_down && !menu_key_was_down)
+        {
+            g_menu_open = !g_menu_open;
+
+            if (g_menu_open)
+            {
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            }
+            else
+            {
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                // Discard the next cursor delta so the camera does not
+                // jump to wherever the cursor was while the menu was open.
+                g_first_cursor_event = true;
+            }
+        }
+        menu_key_was_down = menu_key_down;
+
         // Shader hot-reload on R (rising edge). On failure the old
         // program is kept so development can continue uninterrupted.
         const bool reload_key_down =
@@ -449,25 +548,70 @@ int main()
 
         if (reload_key_down && !reload_key_was_down)
         {
-            const unsigned int new_program = create_shader_program(
-                vertex_path,
-                fragment_path
-            );
-
-            if (new_program != 0)
-            {
-                glDeleteProgram(shader_program);
-                shader_program = new_program;
-                uniforms = query_uniforms(shader_program);
+            if (load_fragment(current_fragment))
                 std::cout << "Shaders reloaded.\n";
-            }
-            else
-            {
-                std::cerr
-                    << "Shader reload failed; keeping previous program.\n";
-            }
         }
         reload_key_was_down = reload_key_down;
+
+        // Build the UI for this frame.
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        if (g_menu_open)
+        {
+            ImGui::SetNextWindowPos(
+                ImVec2(10.0f, 10.0f),
+                ImGuiCond_FirstUseEver
+            );
+            ImGui::Begin(
+                "Menu",
+                nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize
+            );
+
+            const float fps = ImGui::GetIO().Framerate;
+            ImGui::Text(
+                "%.1f FPS (%.2f ms)",
+                fps,
+                fps > 0.0f ? 1000.0f / fps : 0.0f
+            );
+            ImGui::Separator();
+
+            const std::string current_name =
+                std::filesystem::path(current_fragment).filename().string();
+
+            if (ImGui::BeginCombo("World", current_name.c_str()))
+            {
+                for (const std::string& file : shader_files)
+                {
+                    const std::string name =
+                        std::filesystem::path(file).filename().string();
+                    const bool is_selected = (file == current_fragment);
+
+                    if (ImGui::Selectable(name.c_str(), is_selected)
+                        && !is_selected)
+                    {
+                        load_fragment(file);
+                    }
+
+                    if (is_selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+
+            if (ImGui::Button("Rescan"))
+                shader_files = list_fragment_shaders(shader_directory);
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Reload"))
+                load_fragment(current_fragment);
+
+            ImGui::TextDisabled("Tab closes the menu. R reloads.");
+            ImGui::End();
+        }
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -488,6 +632,9 @@ int main()
 
         glBindVertexArray(VAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -513,6 +660,10 @@ int main()
             fps_frame_count = 0;
         }
     }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
