@@ -28,12 +28,25 @@ target_sources(RayMarching
     PRIVATE
         assets/shaders/basic.glsl
         assets/shaders/basic.frag
+        assets/shaders/raymarch.frag
 )
 
-add_custom_command(
-    TARGET RayMarching POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/assets"
-        "$<TARGET_FILE_DIR:RayMarching>/assets"
-    COMMENT "Copying assets to output directory"
-)
+# Copy each asset as a real build step with declared inputs/outputs,
+# so editing a shader makes the build out of date and re-copies it.
+file(GLOB_RECURSE ASSET_FILES RELATIVE "${CMAKE_SOURCE_DIR}" CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/*")
+
+set(ASSET_OUTPUTS "")
+foreach(asset IN LISTS ASSET_FILES)
+    set(out "${CMAKE_BINARY_DIR}/${asset}")
+    add_custom_command(
+        OUTPUT "${out}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/${asset}" "${out}"
+        DEPENDS "${CMAKE_SOURCE_DIR}/${asset}"
+        COMMENT "Copying ${asset}"
+    )
+    list(APPEND ASSET_OUTPUTS "${out}")
+endforeach()
+
+add_custom_target(copy_assets DEPENDS ${ASSET_OUTPUTS})
+add_dependencies(RayMarching copy_assets)

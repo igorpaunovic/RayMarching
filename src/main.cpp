@@ -1,21 +1,165 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
+#include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
+// Framebuffer size, kept up to date by the resize callback so the
+// uResolution uniform is always correct.
+static int g_framebuffer_width = 800;
+static int g_framebuffer_height = 600;
+
+struct Camera
+{
+    // Position in world space.
+    float x = 0.0f;
+    float y = 1.5f;
+    float z = -5.0f;
+
+    // Orientation (radians). Yaw rotates around the world Y axis,
+    // pitch around the camera's right axis.
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+};
+
+static Camera g_camera;
+
+// Last cursor position, used to compute mouse-look deltas.
+static double g_last_cursor_x = 0.0;
+static double g_last_cursor_y = 0.0;
+static bool g_first_cursor_event = true;
+
+// ---------------------------------------------------------------------------
+// GLFW callbacks
+// ---------------------------------------------------------------------------
+
 void framebuffer_size_callback(GLFWwindow*, int width, int height)
 {
+    g_framebuffer_width = width;
+    g_framebuffer_height = height;
     glViewport(0, 0, width, height);
 }
 
-void process_input(GLFWwindow *window)
+void cursor_pos_callback(GLFWwindow*, double xpos, double ypos)
 {
-    if(glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
+    if (g_first_cursor_event)
+    {
+        g_last_cursor_x = xpos;
+        g_last_cursor_y = ypos;
+        g_first_cursor_event = false;
+        return;
+    }
+
+    const double dx = xpos - g_last_cursor_x;
+    const double dy = ypos - g_last_cursor_y;
+    g_last_cursor_x = xpos;
+    g_last_cursor_y = ypos;
+
+    constexpr float sensitivity = 0.0025f;
+    g_camera.yaw += static_cast<float>(dx) * sensitivity;
+    g_camera.pitch -= static_cast<float>(dy) * sensitivity;
+
+    // Clamp pitch to avoid flipping over the poles.
+    constexpr float pitch_limit = 1.55f; // just under pi/2
+    if (g_camera.pitch > pitch_limit)
+        g_camera.pitch = pitch_limit;
+    if (g_camera.pitch < -pitch_limit)
+        g_camera.pitch = -pitch_limit;
 }
+
+// ---------------------------------------------------------------------------
+// Camera basis and movement
+// ---------------------------------------------------------------------------
+
+// Builds the camera rotation basis as a column-major 3x3 matrix:
+// columns are (right, up, forward). Forward at yaw = 0, pitch = 0 is +Z.
+void camera_basis(const Camera& cam, float out[9])
+{
+    const float cy = std::cos(cam.yaw);
+    const float sy = std::sin(cam.yaw);
+    const float cp = std::cos(cam.pitch);
+    const float sp = std::sin(cam.pitch);
+
+    // Forward vector.
+    const float fx = cp * sy;
+    const float fy = sp;
+    const float fz = cp * cy;
+
+    // Right vector = normalize(cross(forward, world up)); for a
+    // yaw/pitch camera this simplifies to a pure yaw rotation of +X.
+    const float rx = cy;
+    const float ry = 0.0f;
+    const float rz = -sy;
+
+    // Up vector = cross(forward, right); with the screen convention
+    // (x right, y up, z forward) the basis is left-handed, so this
+    // order yields +Y up at zero pitch.
+    const float ux = fy * rz - fz * ry;
+    const float uy = fz * rx - fx * rz;
+    const float uz = fx * ry - fy * rx;
+
+    // Column-major layout for glUniformMatrix3fv.
+    out[0] = rx; out[1] = ry; out[2] = rz; // column 0: right
+    out[3] = ux; out[4] = uy; out[5] = uz; // column 1: up
+    out[6] = fx; out[7] = fy; out[8] = fz; // column 2: forward
+}
+
+void process_input(GLFWwindow* window, float delta_time)
+{
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+
+    float speed = 4.0f * delta_time;
+    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+        speed *= 3.0f;
+
+    float basis[9];
+    camera_basis(g_camera, basis);
+
+    const float* right = &basis[0];
+    const float* forward = &basis[6];
+
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+    {
+        g_camera.x += forward[0] * speed;
+        g_camera.y += forward[1] * speed;
+        g_camera.z += forward[2] * speed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+    {
+        g_camera.x -= forward[0] * speed;
+        g_camera.y -= forward[1] * speed;
+        g_camera.z -= forward[2] * speed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+    {
+        g_camera.x += right[0] * speed;
+        g_camera.y += right[1] * speed;
+        g_camera.z += right[2] * speed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+    {
+        g_camera.x -= right[0] * speed;
+        g_camera.y -= right[1] * speed;
+        g_camera.z -= right[2] * speed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
+        g_camera.y += speed;
+    if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS)
+        g_camera.y -= speed;
+}
+
+// ---------------------------------------------------------------------------
+// Shader loading
+// ---------------------------------------------------------------------------
 
 std::string load_shader_source(const char* path)
 {
@@ -115,6 +259,29 @@ unsigned int create_shader_program(
     return program;
 }
 
+// Uniform locations for the ray marching shader.
+struct Uniforms
+{
+    int resolution = -1;
+    int time = -1;
+    int cam_pos = -1;
+    int cam_rot = -1;
+};
+
+Uniforms query_uniforms(unsigned int program)
+{
+    Uniforms u;
+    u.resolution = glGetUniformLocation(program, "uResolution");
+    u.time = glGetUniformLocation(program, "uTime");
+    u.cam_pos = glGetUniformLocation(program, "uCamPos");
+    u.cam_rot = glGetUniformLocation(program, "uCamRot");
+    return u;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 int main()
 {
     if (!glfwInit())
@@ -153,30 +320,36 @@ int main()
         return 1;
     }
 
-    // Get the actual framebuffer dimensions.
-    // These may differ from the requested window dimensions on high-DPI screens.
-    int framebufferWidth = 0;
-    int framebufferHeight = 0;
-
     glfwGetFramebufferSize(
         window,
-        &framebufferWidth,
-        &framebufferHeight
+        &g_framebuffer_width,
+        &g_framebuffer_height
     );
 
-    // Configure the initial OpenGL viewport.
     glViewport(
         0,
         0,
-        framebufferWidth,
-        framebufferHeight
+        g_framebuffer_width,
+        g_framebuffer_height
     );
 
-    // Update the viewport whenever the framebuffer is resized.
     glfwSetFramebufferSizeCallback(
         window,
         framebuffer_size_callback
     );
+
+    // Capture the cursor for mouse-look. Raw motion (when available)
+    // avoids OS cursor acceleration affecting the camera.
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    if (glfwRawMouseMotionSupported())
+        glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+
+    // Seed the last-cursor position so the first mouse event does not
+    // produce a huge spurious camera rotation.
+    glfwGetCursorPos(window, &g_last_cursor_x, &g_last_cursor_y);
+    g_first_cursor_event = false;
+
+    glfwSetCursorPosCallback(window, cursor_pos_callback);
 
     std::cout
         << "OpenGL version: "
@@ -200,9 +373,12 @@ int main()
            )
         << '\n';
 
-    const unsigned int shader_program = create_shader_program(
-        "assets/shaders/basic.glsl",
-        "assets/shaders/basic.frag"
+    const char* vertex_path = "assets/shaders/basic.glsl";
+    const char* fragment_path = "assets/shaders/raymarch.frag";
+
+    unsigned int shader_program = create_shader_program(
+        vertex_path,
+        fragment_path
     );
 
     if (shader_program == 0)
@@ -212,10 +388,18 @@ int main()
         return 1;
     }
 
+    Uniforms uniforms = query_uniforms(shader_program);
+
+    // Full-screen quad in normalized device coordinates
+    // (two triangles covering [-1, 1] x [-1, 1]).
     float vertices[] = {
-        -0.5f, -0.5f, 0.0f,
-         0.5f, -0.5f, 0.0f,
-         0.0f,  0.5f, 0.0f
+        -1.0f, -1.0f, 0.0f,
+         1.0f, -1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,
+
+        -1.0f, -1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,
+        -1.0f,  1.0f, 0.0f
     };
 
     unsigned int VAO = 0;
@@ -241,19 +425,93 @@ int main()
 
     glBindVertexArray(0);
 
+    double last_frame_time = glfwGetTime();
+
+    // FPS counter state.
+    double fps_timer = last_frame_time;
+    int fps_frame_count = 0;
+
+    // Edge detection for the hot-reload key.
+    bool reload_key_was_down = false;
+
     while (!glfwWindowShouldClose(window))
     {
-        process_input(window);
+        const double now = glfwGetTime();
+        const float delta_time = static_cast<float>(now - last_frame_time);
+        last_frame_time = now;
 
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+        process_input(window, delta_time);
+
+        // Shader hot-reload on R (rising edge). On failure the old
+        // program is kept so development can continue uninterrupted.
+        const bool reload_key_down =
+            glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
+
+        if (reload_key_down && !reload_key_was_down)
+        {
+            const unsigned int new_program = create_shader_program(
+                vertex_path,
+                fragment_path
+            );
+
+            if (new_program != 0)
+            {
+                glDeleteProgram(shader_program);
+                shader_program = new_program;
+                uniforms = query_uniforms(shader_program);
+                std::cout << "Shaders reloaded.\n";
+            }
+            else
+            {
+                std::cerr
+                    << "Shader reload failed; keeping previous program.\n";
+            }
+        }
+        reload_key_was_down = reload_key_down;
+
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(shader_program);
+
+        glUniform2f(
+            uniforms.resolution,
+            static_cast<float>(g_framebuffer_width),
+            static_cast<float>(g_framebuffer_height)
+        );
+        glUniform1f(uniforms.time, static_cast<float>(now));
+        glUniform3f(uniforms.cam_pos, g_camera.x, g_camera.y, g_camera.z);
+
+        float basis[9];
+        camera_basis(g_camera, basis);
+        glUniformMatrix3fv(uniforms.cam_rot, 1, GL_FALSE, basis);
+
         glBindVertexArray(VAO);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        // Update the FPS counter in the window title once per second.
+        ++fps_frame_count;
+        if (now - fps_timer >= 1.0)
+        {
+            const double fps = fps_frame_count / (now - fps_timer);
+            const double frame_ms = 1000.0 / (fps > 0.0 ? fps : 1.0);
+
+            char title[128];
+            std::snprintf(
+                title,
+                sizeof(title),
+                "RayMarching - %.1f FPS (%.2f ms)",
+                fps,
+                frame_ms
+            );
+            glfwSetWindowTitle(window, title);
+
+            fps_timer = now;
+            fps_frame_count = 0;
+        }
     }
 
     glDeleteVertexArrays(1, &VAO);
