@@ -135,7 +135,7 @@ void process_input(GLFWwindow* window, float delta_time)
     if (g_menu_open)
         return;
 
-    float speed = 4.0f * delta_time;
+    float speed = 6.0f * delta_time;
     if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
         speed *= 3.0f;
 
@@ -179,8 +179,21 @@ void process_input(GLFWwindow* window, float delta_time)
 // Shader loading
 // ---------------------------------------------------------------------------
 
-std::string load_shader_source(const char* path)
+// Loads a shader source file, expanding #include "file" directives
+// (paths resolved relative to the including file). #line directives
+// are injected around spliced content so GLSL compile errors report
+// the correct line in the correct file: the source-string number in
+// the error corresponds to include depth (0 = the world shader).
+std::string load_shader_source(
+    const std::filesystem::path& path,
+    int depth = 0)
 {
+    if (depth > 8)
+    {
+        std::cerr << "Shader include depth exceeded at: " << path << '\n';
+        return {};
+    }
+
     std::ifstream file(path);
 
     if (!file.is_open())
@@ -189,9 +202,54 @@ std::string load_shader_source(const char* path)
         return {};
     }
 
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
+    std::ostringstream out;
+    std::string line;
+    int line_number = 0;
+
+    while (std::getline(file, line))
+    {
+        ++line_number;
+
+        const size_t start = line.find_first_not_of(" \t");
+        const bool is_include =
+            start != std::string::npos
+            && line.compare(start, 8, "#include") == 0;
+
+        if (!is_include)
+        {
+            out << line << '\n';
+            continue;
+        }
+
+        const size_t open = line.find('"', start + 8);
+        const size_t close =
+            (open == std::string::npos)
+                ? std::string::npos
+                : line.find('"', open + 1);
+
+        if (close == std::string::npos)
+        {
+            std::cerr
+                << path << ':' << line_number
+                << ": malformed #include directive\n";
+            return {};
+        }
+
+        const std::string name = line.substr(open + 1, close - open - 1);
+        const std::string included = load_shader_source(
+            path.parent_path() / name,
+            depth + 1
+        );
+
+        if (included.empty())
+            return {};
+
+        out << "#line 1 " << (depth + 1) << '\n'
+            << included
+            << "#line " << (line_number + 1) << ' ' << depth << '\n';
+    }
+
+    return out.str();
 }
 
 unsigned int compile_shader(
@@ -321,7 +379,7 @@ std::vector<std::string> list_fragment_shaders(const char* directory)
 // Main
 // ---------------------------------------------------------------------------
 
-int main()
+int main(int argc, char** argv)
 {
     if (!glfwInit())
     {
@@ -424,7 +482,11 @@ int main()
     const char* vertex_path = "assets/shaders/basic.glsl";
     const char* shader_directory = "assets/shaders";
 
-    std::string current_fragment = "assets/shaders/raymarch.frag";
+    // An optional command-line argument selects the startup world,
+    // e.g. `RayMarching assets/shaders/fractal.frag`.
+    std::string current_fragment = (argc > 1)
+        ? argv[1]
+        : "assets/shaders/raymarch.frag";
     std::vector<std::string> shader_files =
         list_fragment_shaders(shader_directory);
 

@@ -37,9 +37,14 @@ target_sources(RayMarching
     PRIVATE
         assets/shaders/basic.glsl
         assets/shaders/basic.frag
+        assets/shaders/worldlib.glsl
         assets/shaders/raymarch.frag
         assets/shaders/fractal.frag
         assets/shaders/large_fractal.frag
+        assets/shaders/clouds.frag
+        assets/shaders/efficient_clouds.frag
+        assets/shaders/non_euclidean.frag
+        assets/shaders/blood_stream.frag
 )
 
 # Copy each asset as a real build step with declared inputs/outputs,
