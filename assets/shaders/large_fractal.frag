@@ -84,10 +84,10 @@ float mandelboxDE(vec3 p)
 // The fractal is evaluated in unit space and the distance is scaled
 // back up, which is how you enlarge an SDF without distorting it.
 // The structure is pushed ahead of the spawn point so the camera
-// starts outside it with a full view instead of embedded in mass.
+// starts just outside it, close enough that it fills the view.
 vec2 map(vec3 p)
 {
-    vec3 q = p - vec3(0.0, 0.0, 100.0);
+    vec3 q = p - vec3(0.0, 0.0, 45.0);
     float d = mandelboxDE(q / WORLD_SCALE) * WORLD_SCALE;
     return vec2(d, MAT_FRACTAL);
 }

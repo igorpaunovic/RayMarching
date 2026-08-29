@@ -48,6 +48,10 @@ static bool g_first_cursor_event = true;
 // camera input (mouse-look and WASD) is suspended.
 static bool g_menu_open = false;
 
+// Base fly speed in world units per second, adjustable from the menu;
+// holding Shift still triples it.
+static float g_move_speed = 6.0f;
+
 // ---------------------------------------------------------------------------
 // GLFW callbacks
 // ---------------------------------------------------------------------------
@@ -135,7 +139,7 @@ void process_input(GLFWwindow* window, float delta_time)
     if (g_menu_open)
         return;
 
-    float speed = 6.0f * delta_time;
+    float speed = g_move_speed * delta_time;
     if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
         speed *= 3.0f;
 
@@ -549,6 +553,12 @@ int main(int argc, char** argv)
         glDeleteProgram(shader_program);
         shader_program = new_program;
         uniforms = query_uniforms(shader_program);
+
+        // Switching to a different world resets the camera to the
+        // starting pose; reloading the current one keeps it.
+        if (fragment_path != current_fragment)
+            g_camera = Camera{};
+
         current_fragment = fragment_path;
         return true;
     };
@@ -696,6 +706,17 @@ int main(int argc, char** argv)
 
             if (ImGui::Button("Reload"))
                 load_fragment(current_fragment);
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Controls");
+            ImGui::SliderFloat(
+                "Move speed",
+                &g_move_speed,
+                0.5f,
+                60.0f,
+                "%.1f",
+                ImGuiSliderFlags_Logarithmic
+            );
 
             // Effect toggles; worlds that lack the matching uniform
             // simply ignore them.
