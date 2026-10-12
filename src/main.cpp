@@ -6,6 +6,7 @@
 #include <imgui_impl_opengl3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -128,6 +130,42 @@ void camera_basis(const Camera& cam, float out[9])
     out[0] = rx; out[1] = ry; out[2] = rz; // column 0: right
     out[3] = ux; out[4] = uy; out[5] = uz; // column 1: up
     out[6] = fx; out[7] = fy; out[8] = fz; // column 2: forward
+}
+
+// Column-major 3x3 rotation helpers for mesh model matrices. These
+// match the rotX/rotY conventions used inside the world shaders, so a
+// mesh body can invert the shader's world-to-local transform exactly.
+void mat3_rot_x(float a, float out[9])
+{
+    const float c = std::cos(a);
+    const float s = std::sin(a);
+    out[0] = 1.0f; out[1] = 0.0f; out[2] = 0.0f;
+    out[3] = 0.0f; out[4] = c;    out[5] = s;
+    out[6] = 0.0f; out[7] = -s;   out[8] = c;
+}
+
+void mat3_rot_y(float a, float out[9])
+{
+    const float c = std::cos(a);
+    const float s = std::sin(a);
+    out[0] = c;    out[1] = 0.0f; out[2] = -s;
+    out[3] = 0.0f; out[4] = 1.0f; out[5] = 0.0f;
+    out[6] = s;    out[7] = 0.0f; out[8] = c;
+}
+
+// out = a * b (column-major).
+void mat3_mul(const float a[9], const float b[9], float out[9])
+{
+    for (int col = 0; col < 3; ++col)
+    {
+        for (int row = 0; row < 3; ++row)
+        {
+            out[col * 3 + row] =
+                a[0 * 3 + row] * b[col * 3 + 0]
+                + a[1 * 3 + row] * b[col * 3 + 1]
+                + a[2 * 3 + row] * b[col * 3 + 2];
+        }
+    }
 }
 
 void process_input(GLFWwindow* window, float delta_time)
@@ -405,6 +443,579 @@ std::vector<std::string> list_fragment_shaders(const char* directory)
 }
 
 // ---------------------------------------------------------------------------
+// Traditional rasterization: mesh solar system
+//
+// The same mini solar system as fractal_galaxy.frag, but built from
+// real triangle meshes pushed through a vertex shader with a depth
+// buffer, so raymarching and rasterization can be compared directly.
+// ---------------------------------------------------------------------------
+
+struct Mesh
+{
+    unsigned int vao = 0;
+    unsigned int vbo = 0;
+    unsigned int ebo = 0;
+    int index_count = 0;
+};
+
+Mesh upload_mesh(
+    const std::vector<float>& vertices, // interleaved pos(3) + normal(3)
+    const std::vector<unsigned int>& indices)
+{
+    Mesh mesh;
+    mesh.index_count = static_cast<int>(indices.size());
+
+    glGenVertexArrays(1, &mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glGenBuffers(1, &mesh.ebo);
+
+    glBindVertexArray(mesh.vao);
+
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+        vertices.data(),
+        GL_STATIC_DRAW
+    );
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(
+        GL_ELEMENT_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(indices.size() * sizeof(unsigned int)),
+        indices.data(),
+        GL_STATIC_DRAW
+    );
+
+    glVertexAttribPointer(
+        0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        reinterpret_cast<void*>(0)
+    );
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(
+        1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+        reinterpret_cast<void*>(3 * sizeof(float))
+    );
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+    return mesh;
+}
+
+// Unit UV sphere; normals equal positions.
+Mesh create_sphere_mesh(int stacks, int slices)
+{
+    std::vector<float> vertices;
+    std::vector<unsigned int> indices;
+    vertices.reserve((stacks + 1) * (slices + 1) * 6);
+
+    constexpr float pi = 3.14159265358979f;
+
+    for (int i = 0; i <= stacks; ++i)
+    {
+        const float phi = pi * static_cast<float>(i) / stacks;
+        const float y = std::cos(phi);
+        const float r = std::sin(phi);
+
+        for (int j = 0; j <= slices; ++j)
+        {
+            const float theta =
+                2.0f * pi * static_cast<float>(j) / slices;
+            const float x = r * std::cos(theta);
+            const float z = r * std::sin(theta);
+
+            vertices.insert(vertices.end(), { x, y, z, x, y, z });
+        }
+    }
+
+    for (int i = 0; i < stacks; ++i)
+    {
+        for (int j = 0; j < slices; ++j)
+        {
+            const unsigned int a = i * (slices + 1) + j;
+            const unsigned int b = a + slices + 1;
+
+            indices.insert(indices.end(), { a, b, a + 1 });
+            indices.insert(indices.end(), { a + 1, b, b + 1 });
+        }
+    }
+
+    return upload_mesh(vertices, indices);
+}
+
+// Flat annulus in the xz plane (normal +Y), radii in object units.
+Mesh create_annulus_mesh(float inner, float outer, int segments)
+{
+    std::vector<float> vertices;
+    std::vector<unsigned int> indices;
+
+    constexpr float pi = 3.14159265358979f;
+
+    for (int j = 0; j <= segments; ++j)
+    {
+        const float theta = 2.0f * pi * static_cast<float>(j) / segments;
+        const float c = std::cos(theta);
+        const float s = std::sin(theta);
+
+        vertices.insert(
+            vertices.end(),
+            { inner * c, 0.0f, inner * s, 0.0f, 1.0f, 0.0f }
+        );
+        vertices.insert(
+            vertices.end(),
+            { outer * c, 0.0f, outer * s, 0.0f, 1.0f, 0.0f }
+        );
+    }
+
+    for (int j = 0; j < segments; ++j)
+    {
+        const unsigned int a = j * 2;
+        indices.insert(indices.end(), { a, a + 1, a + 2 });
+        indices.insert(indices.end(), { a + 2, a + 1, a + 3 });
+    }
+
+    return upload_mesh(vertices, indices);
+}
+
+// ---------------------------------------------------------------------------
+// Meshed Mandelbox
+//
+// The same fractal as large_fractal.frag, baked into a triangle mesh:
+// the distance estimator is sampled on a grid and an isosurface is
+// extracted with surface nets, with normals and ambient occlusion
+// computed from the same DE the raymarcher uses.
+// ---------------------------------------------------------------------------
+
+// Fractal parameters and placement, identical to large_fractal.frag.
+namespace mbox
+{
+    constexpr float box_scale      = -1.77f;
+    constexpr int   iterations     = 13;
+    constexpr float min_radius_2   = 0.25f;
+    constexpr float fixed_radius_2 = 1.0f;
+
+    // The fractal is evaluated in unit space, blown up by WORLD_SCALE
+    // and pushed ahead of the spawn point, like the raymarched world.
+    constexpr float world_scale = 12.0f;
+    constexpr float pos[3] = { 0.0f, 0.0f, 45.0f };
+}
+
+// CPU mirror of mandelboxDE in large_fractal.frag (minus the orbit
+// trap, which the mesh fragment shader re-evaluates per pixel).
+float mandelbox_de(float px, float py, float pz)
+{
+    float zx = px;
+    float zy = py;
+    float zz = pz;
+    float dr = 1.0f;
+
+    for (int i = 0; i < mbox::iterations; ++i)
+    {
+        // Box fold.
+        zx = std::clamp(zx, -1.0f, 1.0f) * 2.0f - zx;
+        zy = std::clamp(zy, -1.0f, 1.0f) * 2.0f - zy;
+        zz = std::clamp(zz, -1.0f, 1.0f) * 2.0f - zz;
+
+        // Sphere fold.
+        const float r2 = zx * zx + zy * zy + zz * zz;
+        if (r2 < mbox::min_radius_2)
+        {
+            const float f = mbox::fixed_radius_2 / mbox::min_radius_2;
+            zx *= f; zy *= f; zz *= f;
+            dr *= f;
+        }
+        else if (r2 < mbox::fixed_radius_2)
+        {
+            const float f = mbox::fixed_radius_2 / r2;
+            zx *= f; zy *= f; zz *= f;
+            dr *= f;
+        }
+
+        zx = zx * mbox::box_scale + px;
+        zy = zy * mbox::box_scale + py;
+        zz = zz * mbox::box_scale + pz;
+        dr = dr * std::abs(mbox::box_scale) + 1.0f;
+    }
+
+    return std::sqrt(zx * zx + zy * zy + zz * zz) / std::abs(dr);
+}
+
+// Splits [0, count) into contiguous ranges and runs fn(begin, end) on
+// one thread per hardware core. Used for the expensive DE sampling.
+template <typename Fn>
+void parallel_ranges(int count, Fn fn)
+{
+    int num_threads =
+        static_cast<int>(std::thread::hardware_concurrency());
+    num_threads = std::clamp(num_threads, 1, std::max(count, 1));
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < num_threads; ++t)
+    {
+        const int begin = count * t / num_threads;
+        const int end = count * (t + 1) / num_threads;
+        if (begin < end)
+            workers.emplace_back(fn, begin, end);
+    }
+
+    for (std::thread& w : workers)
+        w.join();
+}
+
+// Bakes the Mandelbox into a triangle mesh in fractal (unit) space.
+// res is the sample count along the longest axis of the fractal's
+// bounding box; the isosurface DE = half a cell stands in for the
+// raymarcher's hit threshold. Every vertex also gets a normal from
+// the DE gradient (like calcNormal). iso_world_out receives the
+// world-space DE value the surface was extracted at, so the fragment
+// shader can re-root the field on the mesh for shadow and AO rays.
+Mesh create_mandelbox_mesh(int res, float& iso_world_out)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // --- Pass 1: tight bounding box from a coarse scan. Because the
+    // DE never overestimates the true distance, every surface point
+    // has DE <= half a coarse cell diagonal at its nearest coarse
+    // sample, so this threshold provably cannot cut geometry off.
+    constexpr int coarse_n = 64;
+    constexpr float domain = 8.0f; // generous outer bound
+    constexpr float coarse_h = 2.0f * domain / (coarse_n - 1);
+    constexpr float coarse_thresh = coarse_h * 0.87f + 0.05f;
+
+    float bb_min[3] = { domain, domain, domain };
+    float bb_max[3] = { -domain, -domain, -domain };
+
+    for (int k = 0; k < coarse_n; ++k)
+    for (int j = 0; j < coarse_n; ++j)
+    for (int i = 0; i < coarse_n; ++i)
+    {
+        const float x = -domain + coarse_h * i;
+        const float y = -domain + coarse_h * j;
+        const float z = -domain + coarse_h * k;
+
+        if (mandelbox_de(x, y, z) > coarse_thresh)
+            continue;
+
+        bb_min[0] = std::min(bb_min[0], x - coarse_h);
+        bb_min[1] = std::min(bb_min[1], y - coarse_h);
+        bb_min[2] = std::min(bb_min[2], z - coarse_h);
+        bb_max[0] = std::max(bb_max[0], x + coarse_h);
+        bb_max[1] = std::max(bb_max[1], y + coarse_h);
+        bb_max[2] = std::max(bb_max[2], z + coarse_h);
+    }
+
+    // --- Pass 2: sample the DE on a fine grid over the bounding box
+    // (cubic cells, res samples along the longest axis), threaded.
+    float max_extent = 0.0f;
+    for (int a = 0; a < 3; ++a)
+        max_extent = std::max(max_extent, bb_max[a] - bb_min[a]);
+
+    const float cell = max_extent / static_cast<float>(res - 1);
+    const float iso = cell * 0.5f;
+    iso_world_out = iso * mbox::world_scale;
+
+    int ns[3]; // samples per axis
+    for (int a = 0; a < 3; ++a)
+        ns[a] = static_cast<int>(
+            std::ceil((bb_max[a] - bb_min[a]) / cell)) + 1;
+
+    const int n0 = ns[0];
+    const int n1 = ns[1];
+    const int n2 = ns[2];
+
+    std::vector<float> field(
+        static_cast<size_t>(n0) * n1 * n2);
+
+    auto sample_index = [n0, n1](int i, int j, int k) -> size_t
+    {
+        return (static_cast<size_t>(k) * n1 + j) * n0 + i;
+    };
+
+    parallel_ranges(n2, [&](int k_begin, int k_end)
+    {
+        for (int k = k_begin; k < k_end; ++k)
+        for (int j = 0; j < n1; ++j)
+        for (int i = 0; i < n0; ++i)
+        {
+            field[sample_index(i, j, k)] = mandelbox_de(
+                bb_min[0] + cell * i,
+                bb_min[1] + cell * j,
+                bb_min[2] + cell * k
+            );
+        }
+    });
+
+    // --- Pass 3: surface nets. Every cell whose corners straddle the
+    // isosurface gets one vertex at the average of its edge crossings;
+    // every grid edge that crosses the isosurface connects the four
+    // cells around it with a quad.
+    const int c0 = n0 - 1;
+    const int c1 = n1 - 1;
+    const int c2 = n2 - 1;
+
+    std::vector<int> cell_vertex(
+        static_cast<size_t>(c0) * c1 * c2, -1);
+
+    auto cell_index = [c0, c1](int i, int j, int k) -> size_t
+    {
+        return (static_cast<size_t>(k) * c1 + j) * c0 + i;
+    };
+
+    // Cube corners as (x, y, z) bit offsets, and the 12 edges as
+    // corner index pairs.
+    constexpr int edge[12][2] = {
+        { 0, 1 }, { 2, 3 }, { 4, 5 }, { 6, 7 }, // along x
+        { 0, 2 }, { 1, 3 }, { 4, 6 }, { 5, 7 }, // along y
+        { 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }  // along z
+    };
+
+    std::vector<float> vertices; // pos(3) + normal(3)
+    std::vector<unsigned int> indices;
+
+    for (int k = 0; k < c2; ++k)
+    for (int j = 0; j < c1; ++j)
+    for (int i = 0; i < c0; ++i)
+    {
+        float d[8];
+        int inside_mask = 0;
+        for (int c = 0; c < 8; ++c)
+        {
+            d[c] = field[sample_index(
+                i + (c & 1), j + ((c >> 1) & 1), k + ((c >> 2) & 1))];
+            if (d[c] < iso)
+                inside_mask |= 1 << c;
+        }
+
+        if (inside_mask == 0 || inside_mask == 255)
+            continue;
+
+        // Average of the isosurface crossings on this cell's edges,
+        // in local corner coordinates [0, 1]^3.
+        float px = 0.0f;
+        float py = 0.0f;
+        float pz = 0.0f;
+        int crossings = 0;
+
+        for (const auto& e : edge)
+        {
+            const float da = d[e[0]];
+            const float db = d[e[1]];
+            if ((da < iso) == (db < iso))
+                continue;
+
+            const float t = (iso - da) / (db - da);
+            const float ax = static_cast<float>(e[0] & 1);
+            const float ay = static_cast<float>((e[0] >> 1) & 1);
+            const float az = static_cast<float>((e[0] >> 2) & 1);
+            const float bx = static_cast<float>(e[1] & 1);
+            const float by = static_cast<float>((e[1] >> 1) & 1);
+            const float bz = static_cast<float>((e[1] >> 2) & 1);
+
+            px += ax + (bx - ax) * t;
+            py += ay + (by - ay) * t;
+            pz += az + (bz - az) * t;
+            ++crossings;
+        }
+
+        const float inv = 1.0f / static_cast<float>(crossings);
+        cell_vertex[cell_index(i, j, k)] =
+            static_cast<int>(vertices.size() / 6);
+
+        vertices.insert(vertices.end(), {
+            bb_min[0] + cell * (i + px * inv),
+            bb_min[1] + cell * (j + py * inv),
+            bb_min[2] + cell * (k + pz * inv),
+            0.0f, 0.0f, 0.0f // normal, filled in pass 4
+        });
+    }
+
+    // Quads: one per sign-changing grid edge, joining the vertices of
+    // the four cells that share the edge (winding is irrelevant: the
+    // mesh is drawn without face culling and normals come from the DE
+    // gradient, not the triangles).
+    auto emit_quad = [&](int va, int vb, int vc, int vd)
+    {
+        const unsigned int a = static_cast<unsigned int>(va);
+        const unsigned int b = static_cast<unsigned int>(vb);
+        const unsigned int c = static_cast<unsigned int>(vc);
+        const unsigned int dd = static_cast<unsigned int>(vd);
+        indices.insert(indices.end(), { a, b, c, a, c, dd });
+    };
+
+    for (int k = 0; k < n2; ++k)
+    for (int j = 0; j < n1; ++j)
+    for (int i = 0; i < n0; ++i)
+    {
+        const bool in0 = field[sample_index(i, j, k)] < iso;
+
+        // Edge along x.
+        if (i + 1 < n0 && j > 0 && k > 0 && j < c1 && k < c2
+            && (field[sample_index(i + 1, j, k)] < iso) != in0)
+        {
+            emit_quad(
+                cell_vertex[cell_index(i, j - 1, k - 1)],
+                cell_vertex[cell_index(i, j, k - 1)],
+                cell_vertex[cell_index(i, j, k)],
+                cell_vertex[cell_index(i, j - 1, k)]
+            );
+        }
+
+        // Edge along y.
+        if (j + 1 < n1 && i > 0 && k > 0 && i < c0 && k < c2
+            && (field[sample_index(i, j + 1, k)] < iso) != in0)
+        {
+            emit_quad(
+                cell_vertex[cell_index(i - 1, j, k - 1)],
+                cell_vertex[cell_index(i, j, k - 1)],
+                cell_vertex[cell_index(i, j, k)],
+                cell_vertex[cell_index(i - 1, j, k)]
+            );
+        }
+
+        // Edge along z.
+        if (k + 1 < n2 && i > 0 && j > 0 && i < c0 && j < c1
+            && (field[sample_index(i, j, k + 1)] < iso) != in0)
+        {
+            emit_quad(
+                cell_vertex[cell_index(i - 1, j - 1, k)],
+                cell_vertex[cell_index(i, j - 1, k)],
+                cell_vertex[cell_index(i, j, k)],
+                cell_vertex[cell_index(i - 1, j, k)]
+            );
+        }
+    }
+
+    // --- Pass 4: per-vertex normals from the DE gradient (central
+    // differences, like worldlib's calcNormal), threaded. Shadows and
+    // ambient occlusion are not baked: the fragment shader marches
+    // the same DE per pixel, exactly like the raymarched world.
+    const int vertex_count = static_cast<int>(vertices.size() / 6);
+    const float eps = cell * 0.5f;
+
+    parallel_ranges(vertex_count, [&](int begin, int end)
+    {
+        for (int v = begin; v < end; ++v)
+        {
+            float* vert = &vertices[static_cast<size_t>(v) * 6];
+            const float x = vert[0];
+            const float y = vert[1];
+            const float z = vert[2];
+
+            float nx = mandelbox_de(x + eps, y, z)
+                     - mandelbox_de(x - eps, y, z);
+            float ny = mandelbox_de(x, y + eps, z)
+                     - mandelbox_de(x, y - eps, z);
+            float nz = mandelbox_de(x, y, z + eps)
+                     - mandelbox_de(x, y, z - eps);
+
+            const float len =
+                std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 1e-12f)
+            {
+                nx /= len;
+                ny /= len;
+                nz /= len;
+            }
+            else
+            {
+                nx = 0.0f;
+                ny = 1.0f;
+                nz = 0.0f;
+            }
+
+            vert[3] = nx;
+            vert[4] = ny;
+            vert[5] = nz;
+        }
+    });
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t1 - t0).count();
+
+    std::cout
+        << "Mandelbox mesh (res " << res << ", grid "
+        << n0 << "x" << n1 << "x" << n2 << "): "
+        << indices.size() / 3 << " triangles, "
+        << vertex_count << " vertices, baked in " << ms << " ms\n";
+
+    return upload_mesh(vertices, indices);
+}
+
+void delete_mesh(Mesh& mesh)
+{
+    glDeleteVertexArrays(1, &mesh.vao);
+    glDeleteBuffers(1, &mesh.vbo);
+    glDeleteBuffers(1, &mesh.ebo);
+    mesh = Mesh{};
+}
+
+struct RasterUniforms
+{
+    int cam_pos = -1;
+    int cam_rot = -1;
+    int resolution = -1;
+    int time = -1;
+    int model_rot = -1;
+    int model_pos = -1;
+    int scale = -1;
+    int body_id = -1;
+    int ring_inner = -1;
+    int ring_outer = -1;
+
+    // Hybrid effects (the meshed Mandelbox marches its DE for these);
+    // -1 (absent) in programs that don't declare them.
+    int iso_offset = -1;
+    int enable_shadows = -1;
+    int enable_ao = -1;
+    int enable_specular = -1;
+    int enable_fog = -1;
+};
+
+RasterUniforms query_raster_uniforms(unsigned int program)
+{
+    RasterUniforms u;
+    u.cam_pos = glGetUniformLocation(program, "uCamPos");
+    u.cam_rot = glGetUniformLocation(program, "uCamRot");
+    u.resolution = glGetUniformLocation(program, "uResolution");
+    u.time = glGetUniformLocation(program, "uTime");
+    u.model_rot = glGetUniformLocation(program, "uModelRot");
+    u.model_pos = glGetUniformLocation(program, "uModelPos");
+    u.scale = glGetUniformLocation(program, "uScale");
+    u.body_id = glGetUniformLocation(program, "uBodyId");
+    u.ring_inner = glGetUniformLocation(program, "uRingInner");
+    u.ring_outer = glGetUniformLocation(program, "uRingOuter");
+
+    u.iso_offset = glGetUniformLocation(program, "uIsoOffset");
+    u.enable_shadows = glGetUniformLocation(program, "uEnableShadows");
+    u.enable_ao = glGetUniformLocation(program, "uEnableAO");
+    u.enable_specular = glGetUniformLocation(program, "uEnableSpecular");
+    u.enable_fog = glGetUniformLocation(program, "uEnableFog");
+    return u;
+}
+
+// Orbital parameters, mirroring the constants in fractal_galaxy.frag.
+namespace solar
+{
+    constexpr int num_planets = 8;
+    constexpr float sun_pos[3] = { 0.0f, 2.0f, 90.0f };
+    constexpr float sun_radius = 10.0f;
+
+    constexpr float orbit_r[8] =
+        { 16.0f, 22.0f, 28.0f, 34.0f, 46.0f, 58.0f, 68.0f, 77.0f };
+    constexpr float size[8] =
+        { 1.3f, 2.2f, 2.4f, 1.7f, 6.0f, 5.0f, 3.4f, 3.3f };
+    constexpr float omega[8] =
+        { 0.625f, 0.388f, 0.270f, 0.202f, 0.128f, 0.090f, 0.071f, 0.059f };
+    constexpr float phase[8] =
+        { 0.0f, 0.9f, 2.1f, 3.4f, 4.2f, 5.1f, 0.6f, 2.8f };
+    constexpr float tilt[8] =
+        { 0.05f, 3.09f, 0.41f, 0.44f, 0.05f, 0.47f, 1.71f, 0.49f };
+    constexpr float spin[8] =
+        { 0.08f, -0.03f, 0.35f, 0.33f, 0.60f, 0.55f, -0.40f, 0.45f };
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -534,6 +1145,120 @@ int main(int argc, char** argv)
     Uniforms uniforms = query_uniforms(shader_program);
     Effects effects;
 
+    // --- Traditional rasterization pipeline (mesh solar system). ---
+    const char* raster_vertex_path = "assets/shaders/raster/planets.vert";
+    const char* raster_fragment_path = "assets/shaders/raster/planets.frag";
+    const char* raster_sky_path = "assets/shaders/raster/sky.frag";
+
+    // Which world the mesh pipeline renders instead of the fullscreen
+    // raymarching quad.
+    constexpr int kRasterNone = -1;   // raymarching active
+    constexpr int kRasterSolar = 0;   // mesh solar system
+    constexpr int kRasterMandelbox = 1;  // meshed Mandelbox
+    int raster_scene = kRasterNone;
+
+    unsigned int raster_program = 0;
+    unsigned int sky_program = 0;
+    RasterUniforms raster_uniforms;
+    int sky_u_resolution = -1;
+    int sky_u_time = -1;
+    int sky_u_cam_rot = -1;
+
+    auto load_raster_programs = [&]() -> bool
+    {
+        const unsigned int new_raster = create_shader_program(
+            raster_vertex_path,
+            raster_fragment_path
+        );
+        // The sky pass reuses the fullscreen-quad vertex shader.
+        const unsigned int new_sky = create_shader_program(
+            vertex_path,
+            raster_sky_path
+        );
+
+        if (new_raster == 0 || new_sky == 0)
+        {
+            if (new_raster != 0)
+                glDeleteProgram(new_raster);
+            if (new_sky != 0)
+                glDeleteProgram(new_sky);
+            std::cerr
+                << "Raster shader load failed; "
+                << "keeping previous programs.\n";
+            return false;
+        }
+
+        if (raster_program != 0)
+            glDeleteProgram(raster_program);
+        if (sky_program != 0)
+            glDeleteProgram(sky_program);
+
+        raster_program = new_raster;
+        sky_program = new_sky;
+        raster_uniforms = query_raster_uniforms(raster_program);
+        sky_u_resolution = glGetUniformLocation(sky_program, "uResolution");
+        sky_u_time = glGetUniformLocation(sky_program, "uTime");
+        sky_u_cam_rot = glGetUniformLocation(sky_program, "uCamRot");
+        return true;
+    };
+
+    load_raster_programs();
+
+    // --- Mandelbox raster pipeline (own vertex format: baked AO). ---
+    const char* mbox_vertex_path = "assets/shaders/raster/mandelbox.vert";
+    const char* mbox_fragment_path = "assets/shaders/raster/mandelbox.frag";
+    const char* mbox_sky_path = "assets/shaders/raster/mandelbox_sky.frag";
+
+    unsigned int mbox_program = 0;
+    unsigned int mbox_sky_program = 0;
+    RasterUniforms mbox_uniforms;
+    int mbox_sky_u_resolution = -1;
+    int mbox_sky_u_cam_rot = -1;
+    int mbox_sky_u_cam_pos = -1;
+
+    auto load_mbox_programs = [&]() -> bool
+    {
+        const unsigned int new_mbox = create_shader_program(
+            mbox_vertex_path,
+            mbox_fragment_path
+        );
+        // The sky pass reuses the fullscreen-quad vertex shader.
+        const unsigned int new_sky = create_shader_program(
+            vertex_path,
+            mbox_sky_path
+        );
+
+        if (new_mbox == 0 || new_sky == 0)
+        {
+            if (new_mbox != 0)
+                glDeleteProgram(new_mbox);
+            if (new_sky != 0)
+                glDeleteProgram(new_sky);
+            std::cerr
+                << "Mandelbox shader load failed; "
+                << "keeping previous programs.\n";
+            return false;
+        }
+
+        if (mbox_program != 0)
+            glDeleteProgram(mbox_program);
+        if (mbox_sky_program != 0)
+            glDeleteProgram(mbox_sky_program);
+
+        mbox_program = new_mbox;
+        mbox_sky_program = new_sky;
+        mbox_uniforms = query_raster_uniforms(mbox_program);
+        mbox_sky_u_resolution =
+            glGetUniformLocation(mbox_sky_program, "uResolution");
+        mbox_sky_u_cam_rot =
+            glGetUniformLocation(mbox_sky_program, "uCamRot");
+        mbox_sky_u_cam_pos =
+            glGetUniformLocation(mbox_sky_program, "uCamPos");
+        return true;
+    };
+
+    load_mbox_programs();
+
     // Compiles the given fragment shader and swaps it in on success;
     // on failure the current program keeps running.
     auto load_fragment = [&](const std::string& fragment_path) -> bool
@@ -598,6 +1323,24 @@ int main(int argc, char** argv)
 
     glBindVertexArray(0);
 
+    // Meshes for the rasterized solar system. One shared unit sphere
+    // for every round body; annuli at each planet's ring proportions.
+    Mesh sphere_mesh = create_sphere_mesh(64, 128);
+    Mesh saturn_ring_mesh = create_annulus_mesh(1.35f, 2.10f, 128);
+    Mesh uranus_ring_mesh = create_annulus_mesh(1.45f, 1.75f, 128);
+
+    // The Mandelbox mesh is baked lazily on first selection and
+    // rebaked when the resolution changes (sampling the DE on a
+    // ~384^3 grid takes several seconds, so don't pay it at startup).
+    int mbox_res = 384;
+    float mbox_iso_world = 0.0f;
+    Mesh mbox_mesh;
+
+    // VSync on by default; turn it off in the menu when comparing
+    // framerates, otherwise both renderers cap at the refresh rate.
+    bool vsync = true;
+    glfwSwapInterval(1);
+
     double last_frame_time = glfwGetTime();
 
     // FPS counter state.
@@ -646,7 +1389,14 @@ int main(int argc, char** argv)
 
         if (reload_key_down && !reload_key_was_down)
         {
-            if (load_fragment(current_fragment))
+            bool ok = false;
+            if (raster_scene == kRasterSolar)
+                ok = load_raster_programs();
+            else if (raster_scene == kRasterMandelbox)
+                ok = load_mbox_programs();
+            else
+                ok = load_fragment(current_fragment);
+            if (ok)
                 std::cout << "Shaders reloaded.\n";
         }
         reload_key_was_down = reload_key_down;
@@ -674,29 +1424,105 @@ int main(int argc, char** argv)
                 fps,
                 fps > 0.0f ? 1000.0f / fps : 0.0f
             );
+
+            if (ImGui::Checkbox("VSync", &vsync))
+                glfwSwapInterval(vsync ? 1 : 0);
+
             ImGui::Separator();
 
-            const std::string current_name =
-                std::filesystem::path(current_fragment).filename().string();
-
-            if (ImGui::BeginCombo("World", current_name.c_str()))
+            // Worlds, grouped by rendering technique. Selecting an
+            // entry from the other group switches pipelines (and
+            // resets the camera, like any world change).
+            if (ImGui::CollapsingHeader(
+                    "Ray marching (fragment shader)",
+                    ImGuiTreeNodeFlags_DefaultOpen))
             {
                 for (const std::string& file : shader_files)
                 {
                     const std::string name =
                         std::filesystem::path(file).filename().string();
-                    const bool is_selected = (file == current_fragment);
+                    const bool is_selected =
+                        raster_scene == kRasterNone
+                        && (file == current_fragment);
 
                     if (ImGui::Selectable(name.c_str(), is_selected)
                         && !is_selected)
                     {
+                        if (raster_scene != kRasterNone)
+                        {
+                            raster_scene = kRasterNone;
+                            // Same world, different pipeline: still a
+                            // fresh start.
+                            if (file == current_fragment)
+                                g_camera = Camera{};
+                        }
                         load_fragment(file);
                     }
-
-                    if (is_selected)
-                        ImGui::SetItemDefaultFocus();
                 }
-                ImGui::EndCombo();
+            }
+
+            if (ImGui::CollapsingHeader(
+                    "Rasterization (vertex + fragment)",
+                    ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                if (ImGui::Selectable(
+                        "solar_system (mesh)",
+                        raster_scene == kRasterSolar)
+                    && raster_scene != kRasterSolar)
+                {
+                    if (raster_program == 0)
+                        load_raster_programs();
+
+                    if (raster_program != 0)
+                    {
+                        raster_scene = kRasterSolar;
+                        g_camera = Camera{};
+                    }
+                }
+
+                if (raster_program == 0)
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                        "raster shaders failed to compile"
+                    );
+
+                if (ImGui::Selectable(
+                        "large_fractal (mesh)",
+                        raster_scene == kRasterMandelbox)
+                    && raster_scene != kRasterMandelbox)
+                {
+                    if (mbox_program == 0)
+                        load_mbox_programs();
+
+                    if (mbox_program != 0)
+                    {
+                        if (mbox_mesh.index_count == 0)
+                            mbox_mesh = create_mandelbox_mesh(
+                                mbox_res, mbox_iso_world);
+                        raster_scene = kRasterMandelbox;
+                        g_camera = Camera{};
+                    }
+                }
+
+                if (mbox_program == 0)
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                        "mandelbox shaders failed to compile"
+                    );
+
+                // Bake resolution (samples along the longest axis);
+                // rebaking takes a moment, so wait for slider release.
+                if (raster_scene == kRasterMandelbox)
+                {
+                    ImGui::SliderInt(
+                        "Mesh resolution", &mbox_res, 96, 512);
+                    if (ImGui::IsItemDeactivatedAfterEdit())
+                    {
+                        delete_mesh(mbox_mesh);
+                        mbox_mesh = create_mandelbox_mesh(
+                            mbox_res, mbox_iso_world);
+                    }
+                }
             }
 
             if (ImGui::Button("Rescan"))
@@ -705,7 +1531,14 @@ int main(int argc, char** argv)
             ImGui::SameLine();
 
             if (ImGui::Button("Reload"))
-                load_fragment(current_fragment);
+            {
+                if (raster_scene == kRasterSolar)
+                    load_raster_programs();
+                else if (raster_scene == kRasterMandelbox)
+                    load_mbox_programs();
+                else
+                    load_fragment(current_fragment);
+            }
 
             ImGui::Separator();
             ImGui::TextDisabled("Controls");
@@ -713,7 +1546,7 @@ int main(int argc, char** argv)
                 "Move speed",
                 &g_move_speed,
                 0.5f,
-                60.0f,
+                600.0f,
                 "%.1f",
                 ImGuiSliderFlags_Logarithmic
             );
@@ -739,30 +1572,191 @@ int main(int argc, char** argv)
         }
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glUseProgram(shader_program);
-
-        glUniform2f(
-            uniforms.resolution,
-            static_cast<float>(g_framebuffer_width),
-            static_cast<float>(g_framebuffer_height)
-        );
-        glUniform1f(uniforms.time, static_cast<float>(now));
-        glUniform3f(uniforms.cam_pos, g_camera.x, g_camera.y, g_camera.z);
-
-        glUniform1i(uniforms.enable_shadows, effects.shadows ? 1 : 0);
-        glUniform1i(uniforms.enable_ao, effects.ao ? 1 : 0);
-        glUniform1i(uniforms.enable_specular, effects.specular ? 1 : 0);
-        glUniform1i(uniforms.enable_fog, effects.fog ? 1 : 0);
-        glUniform1f(uniforms.curve_scale, effects.curve_scale);
+        const float res_x = static_cast<float>(g_framebuffer_width);
+        const float res_y = static_cast<float>(g_framebuffer_height);
+        const float time = static_cast<float>(now);
 
         float basis[9];
         camera_basis(g_camera, basis);
-        glUniformMatrix3fv(uniforms.cam_rot, 1, GL_FALSE, basis);
 
-        glBindVertexArray(VAO);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+        if (raster_scene == kRasterSolar && raster_program != 0)
+        {
+            // Background first, without depth writes, then the meshes
+            // with a real depth buffer.
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(sky_program);
+            glUniform2f(sky_u_resolution, res_x, res_y);
+            glUniform1f(sky_u_time, time);
+            glUniformMatrix3fv(sky_u_cam_rot, 1, GL_FALSE, basis);
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            glEnable(GL_DEPTH_TEST);
+            glUseProgram(raster_program);
+            const RasterUniforms& ru = raster_uniforms;
+            glUniform2f(ru.resolution, res_x, res_y);
+            glUniform1f(ru.time, time);
+            glUniform3f(ru.cam_pos, g_camera.x, g_camera.y, g_camera.z);
+            glUniformMatrix3fv(ru.cam_rot, 1, GL_FALSE, basis);
+
+            auto draw_body = [&](
+                const Mesh& mesh,
+                int body_id,
+                const float rot[9],
+                float px, float py, float pz,
+                float scale,
+                float ring_inner, float ring_outer)
+            {
+                glUniformMatrix3fv(ru.model_rot, 1, GL_FALSE, rot);
+                glUniform3f(ru.model_pos, px, py, pz);
+                glUniform1f(ru.scale, scale);
+                glUniform1i(ru.body_id, body_id);
+                glUniform1f(ru.ring_inner, ring_inner);
+                glUniform1f(ru.ring_outer, ring_outer);
+                glBindVertexArray(mesh.vao);
+                glDrawElements(
+                    GL_TRIANGLES,
+                    mesh.index_count,
+                    GL_UNSIGNED_INT,
+                    nullptr
+                );
+            };
+
+            const float identity[9] =
+                { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f };
+
+            draw_body(
+                sphere_mesh, 8, identity,
+                solar::sun_pos[0], solar::sun_pos[1], solar::sun_pos[2],
+                solar::sun_radius, 0.0f, 0.0f
+            );
+
+            for (int i = 0; i < solar::num_planets; ++i)
+            {
+                const float a = solar::phase[i] + time * solar::omega[i];
+                const float cx =
+                    solar::sun_pos[0] + std::cos(a) * solar::orbit_r[i];
+                const float cy = solar::sun_pos[1];
+                const float cz =
+                    solar::sun_pos[2] + std::sin(a) * solar::orbit_r[i];
+
+                // The shader maps world to local with
+                // rotY(spin t) * rotX(tilt); the mesh model rotation
+                // is the inverse: rotX(-tilt) * rotY(-spin t).
+                float rx[9];
+                float ry[9];
+                float rot[9];
+                mat3_rot_x(-solar::tilt[i], rx);
+                mat3_rot_y(-time * solar::spin[i], ry);
+                mat3_mul(rx, ry, rot);
+
+                draw_body(
+                    sphere_mesh, i, rot,
+                    cx, cy, cz, solar::size[i], 0.0f, 0.0f
+                );
+
+                if (i == 2) // Earth's Moon
+                {
+                    const float ma = time * 0.45f + 1.3f;
+                    draw_body(
+                        sphere_mesh, 9, identity,
+                        cx + std::cos(ma) * 4.3f,
+                        cy + 0.18f * std::sin(ma * 0.7f) * 4.3f,
+                        cz + std::sin(ma) * 4.3f,
+                        0.6f, 0.0f, 0.0f
+                    );
+                }
+
+                // Rings tilt with the planet but do not spin (they are
+                // rotationally symmetric).
+                if (i == 5)
+                    draw_body(
+                        saturn_ring_mesh, 10, rx,
+                        cx, cy, cz, solar::size[i], 1.35f, 2.10f
+                    );
+                if (i == 6)
+                    draw_body(
+                        uranus_ring_mesh, 11, rx,
+                        cx, cy, cz, solar::size[i], 1.45f, 1.75f
+                    );
+            }
+
+            glDisable(GL_DEPTH_TEST);
+        }
+        else if (raster_scene == kRasterMandelbox && mbox_program != 0)
+        {
+            // Background first, without depth writes, then the mesh
+            // with a real depth buffer.
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(mbox_sky_program);
+            glUniform2f(mbox_sky_u_resolution, res_x, res_y);
+            glUniformMatrix3fv(mbox_sky_u_cam_rot, 1, GL_FALSE, basis);
+            glUniform3f(
+                mbox_sky_u_cam_pos, g_camera.x, g_camera.y, g_camera.z);
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            glEnable(GL_DEPTH_TEST);
+            glUseProgram(mbox_program);
+            const RasterUniforms& mu = mbox_uniforms;
+            glUniform2f(mu.resolution, res_x, res_y);
+            glUniform3f(mu.cam_pos, g_camera.x, g_camera.y, g_camera.z);
+            glUniformMatrix3fv(mu.cam_rot, 1, GL_FALSE, basis);
+
+            // Static, like the raymarched world: identity rotation,
+            // same offset and uniform scale as large_fractal's map().
+            const float identity[9] =
+                { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f };
+            glUniformMatrix3fv(mu.model_rot, 1, GL_FALSE, identity);
+            glUniform3f(
+                mu.model_pos,
+                mbox::pos[0], mbox::pos[1], mbox::pos[2]
+            );
+            glUniform1f(mu.scale, mbox::world_scale);
+
+            // Hybrid effects: the fragment shader marches the DE for
+            // shadows and AO, honoring the same menu toggles as the
+            // raymarched worlds.
+            glUniform1f(mu.iso_offset, mbox_iso_world);
+            glUniform1i(mu.enable_shadows, effects.shadows ? 1 : 0);
+            glUniform1i(mu.enable_ao, effects.ao ? 1 : 0);
+            glUniform1i(mu.enable_specular, effects.specular ? 1 : 0);
+            glUniform1i(mu.enable_fog, effects.fog ? 1 : 0);
+
+            glBindVertexArray(mbox_mesh.vao);
+            glDrawElements(
+                GL_TRIANGLES,
+                mbox_mesh.index_count,
+                GL_UNSIGNED_INT,
+                nullptr
+            );
+
+            glDisable(GL_DEPTH_TEST);
+        }
+        else
+        {
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(shader_program);
+
+            glUniform2f(uniforms.resolution, res_x, res_y);
+            glUniform1f(uniforms.time, time);
+            glUniform3f(
+                uniforms.cam_pos, g_camera.x, g_camera.y, g_camera.z);
+
+            glUniform1i(uniforms.enable_shadows, effects.shadows ? 1 : 0);
+            glUniform1i(uniforms.enable_ao, effects.ao ? 1 : 0);
+            glUniform1i(
+                uniforms.enable_specular, effects.specular ? 1 : 0);
+            glUniform1i(uniforms.enable_fog, effects.fog ? 1 : 0);
+            glUniform1f(uniforms.curve_scale, effects.curve_scale);
+
+            glUniformMatrix3fv(uniforms.cam_rot, 1, GL_FALSE, basis);
+
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
 
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -799,6 +1793,19 @@ int main(int argc, char** argv)
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
     glDeleteProgram(shader_program);
+
+    delete_mesh(sphere_mesh);
+    delete_mesh(saturn_ring_mesh);
+    delete_mesh(uranus_ring_mesh);
+    delete_mesh(mbox_mesh);
+    if (raster_program != 0)
+        glDeleteProgram(raster_program);
+    if (sky_program != 0)
+        glDeleteProgram(sky_program);
+    if (mbox_program != 0)
+        glDeleteProgram(mbox_program);
+    if (mbox_sky_program != 0)
+        glDeleteProgram(mbox_sky_program);
 
     glfwDestroyWindow(window);
     glfwTerminate();

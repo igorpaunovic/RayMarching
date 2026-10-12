@@ -36,15 +36,21 @@ target_link_libraries(RayMarching
 target_sources(RayMarching
     PRIVATE
         assets/shaders/basic.glsl
-        assets/shaders/basic.frag
         assets/shaders/worldlib.glsl
         assets/shaders/raymarch.frag
         assets/shaders/fractal.frag
         assets/shaders/large_fractal.frag
         assets/shaders/clouds.frag
         assets/shaders/efficient_clouds.frag
+        assets/shaders/fractal_galaxy.frag
+        assets/shaders/galaxy_cluster.frag
         assets/shaders/non_euclidean.frag
-        assets/shaders/blood_stream.frag
+        assets/shaders/raster/planets.vert
+        assets/shaders/raster/planets.frag
+        assets/shaders/raster/sky.frag
+        assets/shaders/raster/mandelbox.vert
+        assets/shaders/raster/mandelbox.frag
+        assets/shaders/raster/mandelbox_sky.frag
 )
 
 # Copy each asset as a real build step with declared inputs/outputs,
