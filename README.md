@@ -6,7 +6,8 @@ The application is written in C++17 with OpenGL 3.3. Scenes are implemented as G
 
 ## Gallery
 
-<!-- video links go here -->
+[raymarching mandlebox fractal](https://github.com/user-attachments/assets/d3ee3e9a-b9a2-4864-8885-6bf2bf30d0ed
+)
 
 ## Controls
 
