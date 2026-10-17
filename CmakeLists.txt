@@ -33,6 +33,16 @@ target_link_libraries(RayMarching
         opengl32
 )
 
+# With MinGW, link the GCC runtime statically so the exe runs without
+# libstdc++-6.dll / libgcc / winpthread DLLs on PATH.
+if(MINGW)
+    target_link_options(RayMarching PRIVATE
+        -static-libgcc
+        -static-libstdc++
+        -static
+    )
+endif()
+
 target_sources(RayMarching
     PRIVATE
         assets/shaders/basic.glsl
