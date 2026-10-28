@@ -1551,6 +1551,114 @@ int main(int argc, char** argv)
             if (ImGui::Checkbox("VSync", &vsync))
                 glfwSwapInterval(vsync ? 1 : 0);
 
+            ImGui::Text(
+                "Framebuffer: %d x %d",
+                g_framebuffer_width,
+                g_framebuffer_height
+            );
+
+            if (ImGui::CollapsingHeader("Resolution"))
+            {
+                GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+                const GLFWvidmode* native =
+                    monitor != nullptr
+                        ? glfwGetVideoMode(monitor)
+                        : nullptr;
+
+                if (native != nullptr)
+                {
+                    ImGui::TextDisabled(
+                        "Display: %d x %d @ %d Hz",
+                        native->width,
+                        native->height,
+                        native->refreshRate
+                    );
+                }
+
+                struct ResPreset
+                {
+                    int w;
+                    int h;
+                    const char* label;
+                };
+
+                static const ResPreset kPresets[] = {
+                    { 800,  600,  "800 x 600" },
+                    { 1280, 720,  "1280 x 720 (720p)" },
+                    { 1600, 900,  "1600 x 900" },
+                    { 1920, 1080, "1920 x 1080 (1080p)" },
+                    { 2560, 1440, "2560 x 1440 (1440p)" },
+                    { 3840, 2160, "3840 x 2160 (4K)" },
+                };
+
+                int win_w = 0;
+                int win_h = 0;
+                glfwGetWindowSize(window, &win_w, &win_h);
+
+                for (const ResPreset& preset : kPresets)
+                {
+                    const bool exceeds =
+                        native != nullptr
+                        && (preset.w > native->width
+                            || preset.h > native->height);
+                    const bool is_current =
+                        win_w == preset.w && win_h == preset.h;
+
+                    char label[96];
+                    if (exceeds)
+                    {
+                        std::snprintf(
+                            label,
+                            sizeof(label),
+                            "%s  (larger than display)",
+                            preset.label
+                        );
+                    }
+                    else
+                    {
+                        std::snprintf(
+                            label,
+                            sizeof(label),
+                            "%s",
+                            preset.label
+                        );
+                    }
+
+                    if (ImGui::Selectable(label, is_current)
+                        && !is_current)
+                    {
+                        glfwSetWindowSize(
+                            window, preset.w, preset.h
+                        );
+
+                        // Keep the window on-screen when it fits;
+                        // oversized bench resolutions stay top-left
+                        // so the corner under the menu remains usable.
+                        if (monitor != nullptr && native != nullptr
+                            && !exceeds)
+                        {
+                            int mx = 0;
+                            int my = 0;
+                            glfwGetMonitorPos(monitor, &mx, &my);
+                            glfwSetWindowPos(
+                                window,
+                                mx + (native->width - preset.w) / 2,
+                                my + (native->height - preset.h) / 2
+                            );
+                        }
+                        else
+                        {
+                            glfwSetWindowPos(window, 0, 0);
+                        }
+                    }
+                }
+
+                ImGui::TextDisabled(
+                    "Larger-than-display sizes still render at "
+                    "that pixel count (for benchmarks)."
+                );
+            }
+
             ImGui::Separator();
 
             // Worlds, grouped by rendering technique. Selecting an
