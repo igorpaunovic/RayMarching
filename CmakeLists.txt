@@ -54,13 +54,16 @@ target_sources(RayMarching
         assets/shaders/efficient_clouds.frag
         assets/shaders/fractal_galaxy.frag
         assets/shaders/galaxy_cluster.frag
-        assets/shaders/non_euclidean.frag
+        assets/shaders/torus_world.frag
         assets/shaders/raster/planets.vert
         assets/shaders/raster/planets.frag
         assets/shaders/raster/sky.frag
         assets/shaders/raster/mandelbox.vert
         assets/shaders/raster/mandelbox.frag
         assets/shaders/raster/mandelbox_sky.frag
+        assets/shaders/raster/torus.vert
+        assets/shaders/raster/torus.frag
+        assets/shaders/raster/torus_sky.frag
 )
 
 # Copy each asset as a real build step with declared inputs/outputs,

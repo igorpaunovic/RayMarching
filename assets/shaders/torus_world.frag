@@ -1,13 +1,15 @@
 #version 330 core
 
-// Non-Euclidean world: a single torus repeated endlessly in all three
-// axes, seen through curved space. Two distortions are at work:
+// Torus world: a single torus repeated endlessly in all three axes,
+// seen through curved (non-Euclidean) space. Two distortions are at
+// work:
 //  - domain warping: the SDF is evaluated in space displaced by moving
 //    sine waves, so all geometry breathes and shifts over time;
 //  - bent rays: the march does not travel in straight lines; the ray
 //    direction is deflected through a sinusoidal field at every step,
 //    so light itself follows curved paths (standalone shader - the
 //    worldlib march assumes straight rays and cannot do this).
+// The rasterized counterpart lives in assets/shaders/raster/torus.*.
 
 out vec4 FragColor;
 
@@ -18,14 +20,18 @@ uniform mat3  uCamRot;     // camera basis: columns = (right, up, forward)
 
 // Menu-controlled effects.
 uniform float uCurveScale     = 1.0; // 0 = straight (Euclidean) rays
+uniform bool  uEnableShadows  = true;
 uniform bool  uEnableAO       = true;
 uniform bool  uEnableSpecular = true;
 uniform bool  uEnableFog      = true;
 
 const float FOCAL_LENGTH = 1.5; // ~67 degrees vertical FOV
-const int   MAX_STEPS    = 200;
-const float MAX_DISTANCE = 120.0;
+const int   MAX_STEPS    = 360;
+const float MAX_DISTANCE = 220.0;
 const float HIT_EPSILON  = 0.002;
+
+const int   SHADOW_STEPS    = 32;
+const float MAX_SHADOW      = 40.0;
 
 // Curvature of space: how strongly ray directions are deflected per
 // unit of travel. Steps are capped so the bending integrates smoothly
@@ -146,6 +152,30 @@ float ambientOcclusion(vec3 p, vec3 n)
     return clamp(1.0 - 2.0 * occlusion, 0.0, 1.0);
 }
 
+float softShadow(vec3 ro, vec3 rd)
+{
+    if (!uEnableShadows)
+        return 1.0;
+
+    float result = 1.0;
+    float t = 0.08;
+
+    for (int i = 0; i < SHADOW_STEPS; ++i)
+    {
+        float d = map(ro + rd * t);
+        if (d < HIT_EPSILON)
+            return 0.0;
+
+        result = min(result, 8.0 * d / t);
+        t += clamp(d, 0.05, 1.5);
+
+        if (t > MAX_SHADOW || result < 0.02)
+            break;
+    }
+
+    return clamp(result, 0.0, 1.0);
+}
+
 // ---------------------------------------------------------------------------
 // Shading
 // ---------------------------------------------------------------------------
@@ -188,6 +218,7 @@ vec3 shade(vec3 p, vec3 rd, float t)
 
     vec3 lightDir = normalize(vec3(0.5, 0.8, -0.3));
     float diffuse = max(dot(n, lightDir), 0.0);
+    float shadow = softShadow(p + n * 0.02, lightDir);
     vec3 halfway = normalize(lightDir - rd);
     float specular = uEnableSpecular
         ? pow(max(dot(n, halfway), 0.0), 32.0)
@@ -199,8 +230,8 @@ vec3 shade(vec3 p, vec3 rd, float t)
     float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
 
     vec3 color = vec3(0.0);
-    color += albedo * diffuse * vec3(1.0, 0.95, 0.9);
-    color += vec3(1.0) * specular * 0.4;
+    color += albedo * diffuse * shadow * vec3(1.0, 0.95, 0.9);
+    color += vec3(1.0) * specular * shadow * 0.4;
     color += albedo * vec3(0.20, 0.15, 0.30) * ao;  // ambient
     color += albedo * rim * 0.6;
 

@@ -577,6 +577,62 @@ Mesh create_annulus_mesh(float inner, float outer, int segments)
     return upload_mesh(vertices, indices);
 }
 
+// Torus in the xz plane (major radius R, tube radius r), matching the
+// SDF in torus_world.frag: length(vec2(length(p.xz) - R, p.y)) - r.
+Mesh create_torus_mesh(float R, float r, int segments_major, int segments_tube)
+{
+    std::vector<float> vertices;
+    std::vector<unsigned int> indices;
+    vertices.reserve(
+        (segments_major + 1) * (segments_tube + 1) * 6
+    );
+
+    constexpr float pi = 3.14159265358979f;
+
+    for (int i = 0; i <= segments_major; ++i)
+    {
+        const float u =
+            2.0f * pi * static_cast<float>(i) / segments_major;
+        const float cu = std::cos(u);
+        const float su = std::sin(u);
+
+        for (int j = 0; j <= segments_tube; ++j)
+        {
+            const float v =
+                2.0f * pi * static_cast<float>(j) / segments_tube;
+            const float cv = std::cos(v);
+            const float sv = std::sin(v);
+
+            const float x = (R + r * cv) * cu;
+            const float y = r * sv;
+            const float z = (R + r * cv) * su;
+
+            // Normal points from the tube center ring to the surface.
+            const float nx = cv * cu;
+            const float ny = sv;
+            const float nz = cv * su;
+
+            vertices.insert(
+                vertices.end(), { x, y, z, nx, ny, nz }
+            );
+        }
+    }
+
+    for (int i = 0; i < segments_major; ++i)
+    {
+        for (int j = 0; j < segments_tube; ++j)
+        {
+            const unsigned int a = i * (segments_tube + 1) + j;
+            const unsigned int b = a + segments_tube + 1;
+
+            indices.insert(indices.end(), { a, b, a + 1 });
+            indices.insert(indices.end(), { a + 1, b, b + 1 });
+        }
+    }
+
+    return upload_mesh(vertices, indices);
+}
+
 // ---------------------------------------------------------------------------
 // Meshed Mandelbox
 //
@@ -970,6 +1026,9 @@ struct RasterUniforms
     int enable_ao = -1;
     int enable_specular = -1;
     int enable_fog = -1;
+
+    // Torus-world lattice cell (integer coords for per-cell coloring).
+    int cell = -1;
 };
 
 RasterUniforms query_raster_uniforms(unsigned int program)
@@ -991,6 +1050,7 @@ RasterUniforms query_raster_uniforms(unsigned int program)
     u.enable_ao = glGetUniformLocation(program, "uEnableAO");
     u.enable_specular = glGetUniformLocation(program, "uEnableSpecular");
     u.enable_fog = glGetUniformLocation(program, "uEnableFog");
+    u.cell = glGetUniformLocation(program, "uCell");
     return u;
 }
 
@@ -1155,6 +1215,7 @@ int main(int argc, char** argv)
     constexpr int kRasterNone = -1;   // raymarching active
     constexpr int kRasterSolar = 0;   // mesh solar system
     constexpr int kRasterMandelbox = 1;  // meshed Mandelbox
+    constexpr int kRasterTorus = 2;   // torus world lattice
     int raster_scene = kRasterNone;
 
     unsigned int raster_program = 0;
@@ -1259,6 +1320,63 @@ int main(int argc, char** argv)
 
     load_mbox_programs();
 
+    // --- Torus-world raster pipeline (lattice of mesh tori). ---
+    const char* torus_vertex_path = "assets/shaders/raster/torus.vert";
+    const char* torus_fragment_path = "assets/shaders/raster/torus.frag";
+    const char* torus_sky_path = "assets/shaders/raster/torus_sky.frag";
+
+    unsigned int torus_program = 0;
+    unsigned int torus_sky_program = 0;
+    RasterUniforms torus_uniforms;
+    int torus_sky_u_resolution = -1;
+    int torus_sky_u_time = -1;
+    int torus_sky_u_cam_rot = -1;
+    int torus_sky_u_cam_pos = -1;
+
+    auto load_torus_programs = [&]() -> bool
+    {
+        const unsigned int new_torus = create_shader_program(
+            torus_vertex_path,
+            torus_fragment_path
+        );
+        const unsigned int new_sky = create_shader_program(
+            vertex_path,
+            torus_sky_path
+        );
+
+        if (new_torus == 0 || new_sky == 0)
+        {
+            if (new_torus != 0)
+                glDeleteProgram(new_torus);
+            if (new_sky != 0)
+                glDeleteProgram(new_sky);
+            std::cerr
+                << "Torus-world shader load failed; "
+                << "keeping previous programs.\n";
+            return false;
+        }
+
+        if (torus_program != 0)
+            glDeleteProgram(torus_program);
+        if (torus_sky_program != 0)
+            glDeleteProgram(torus_sky_program);
+
+        torus_program = new_torus;
+        torus_sky_program = new_sky;
+        torus_uniforms = query_raster_uniforms(torus_program);
+        torus_sky_u_resolution =
+            glGetUniformLocation(torus_sky_program, "uResolution");
+        torus_sky_u_time =
+            glGetUniformLocation(torus_sky_program, "uTime");
+        torus_sky_u_cam_rot =
+            glGetUniformLocation(torus_sky_program, "uCamRot");
+        torus_sky_u_cam_pos =
+            glGetUniformLocation(torus_sky_program, "uCamPos");
+        return true;
+    };
+
+    load_torus_programs();
+
     // Compiles the given fragment shader and swaps it in on success;
     // on failure the current program keeps running.
     auto load_fragment = [&](const std::string& fragment_path) -> bool
@@ -1329,6 +1447,9 @@ int main(int argc, char** argv)
     Mesh saturn_ring_mesh = create_annulus_mesh(1.35f, 2.10f, 128);
     Mesh uranus_ring_mesh = create_annulus_mesh(1.45f, 1.75f, 128);
 
+    // Torus matching torus_world.frag (major 2, tube 0.6).
+    Mesh torus_mesh = create_torus_mesh(2.0f, 0.6f, 64, 32);
+
     // The Mandelbox mesh is baked lazily on first selection and
     // rebaked when the resolution changes (sampling the DE on a
     // ~384^3 grid takes several seconds, so don't pay it at startup).
@@ -1394,6 +1515,8 @@ int main(int argc, char** argv)
                 ok = load_raster_programs();
             else if (raster_scene == kRasterMandelbox)
                 ok = load_mbox_programs();
+            else if (raster_scene == kRasterTorus)
+                ok = load_torus_programs();
             else
                 ok = load_fragment(current_fragment);
             if (ok)
@@ -1523,6 +1646,27 @@ int main(int argc, char** argv)
                             mbox_res, mbox_iso_world);
                     }
                 }
+
+                if (ImGui::Selectable(
+                        "torus_world (mesh)",
+                        raster_scene == kRasterTorus)
+                    && raster_scene != kRasterTorus)
+                {
+                    if (torus_program == 0)
+                        load_torus_programs();
+
+                    if (torus_program != 0)
+                    {
+                        raster_scene = kRasterTorus;
+                        g_camera = Camera{};
+                    }
+                }
+
+                if (torus_program == 0)
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                        "torus shaders failed to compile"
+                    );
             }
 
             if (ImGui::Button("Rescan"))
@@ -1536,6 +1680,8 @@ int main(int argc, char** argv)
                     load_raster_programs();
                 else if (raster_scene == kRasterMandelbox)
                     load_mbox_programs();
+                else if (raster_scene == kRasterTorus)
+                    load_torus_programs();
                 else
                     load_fragment(current_fragment);
             }
@@ -1735,6 +1881,82 @@ int main(int argc, char** argv)
 
             glDisable(GL_DEPTH_TEST);
         }
+        else if (raster_scene == kRasterTorus && torus_program != 0)
+        {
+            // Background first (sky + grazing glow), then a lattice of
+            // mesh tori covering the same MAX_DISTANCE = 220 as the
+            // raymarched world. Instances are centered on the camera
+            // cell and distance-culled so fog can hide the far edge.
+            // Curved rays still cannot be reproduced with a depth
+            // buffer - set Curvature to 0 for the closest match.
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(torus_sky_program);
+            glUniform2f(torus_sky_u_resolution, res_x, res_y);
+            glUniform1f(torus_sky_u_time, time);
+            glUniformMatrix3fv(torus_sky_u_cam_rot, 1, GL_FALSE, basis);
+            glUniform3f(
+                torus_sky_u_cam_pos, g_camera.x, g_camera.y, g_camera.z);
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            glEnable(GL_DEPTH_TEST);
+            glUseProgram(torus_program);
+            const RasterUniforms& tu = torus_uniforms;
+            glUniform2f(tu.resolution, res_x, res_y);
+            glUniform1f(tu.time, time);
+            glUniform3f(tu.cam_pos, g_camera.x, g_camera.y, g_camera.z);
+            glUniformMatrix3fv(tu.cam_rot, 1, GL_FALSE, basis);
+            glUniform1i(tu.enable_shadows, effects.shadows ? 1 : 0);
+            glUniform1i(tu.enable_ao, effects.ao ? 1 : 0);
+            glUniform1i(tu.enable_specular, effects.specular ? 1 : 0);
+            glUniform1i(tu.enable_fog, effects.fog ? 1 : 0);
+
+            // Match torus_world.frag: REPEAT 9, MAX_DISTANCE 220.
+            constexpr float kRepeat = 9.0f;
+            constexpr float kMaxDist = 220.0f;
+            constexpr float kTorusReach = 2.6f; // major + tube
+            constexpr int kHalf = 25; // ceil(220 / 9)
+
+            const int cell_x = static_cast<int>(std::floor(
+                (g_camera.x + 0.5f * kRepeat) / kRepeat));
+            const int cell_y = static_cast<int>(std::floor(
+                (g_camera.y + 0.5f * kRepeat) / kRepeat));
+            const int cell_z = static_cast<int>(std::floor(
+                (g_camera.z + 0.5f * kRepeat) / kRepeat));
+
+            const float cull_r = kMaxDist + kTorusReach;
+            const float cull_r2 = cull_r * cull_r;
+
+            glBindVertexArray(torus_mesh.vao);
+
+            for (int dz = -kHalf; dz <= kHalf; ++dz)
+            for (int dy = -kHalf; dy <= kHalf; ++dy)
+            for (int dx = -kHalf; dx <= kHalf; ++dx)
+            {
+                const float px =
+                    static_cast<float>(cell_x + dx) * kRepeat;
+                const float py =
+                    static_cast<float>(cell_y + dy) * kRepeat;
+                const float pz =
+                    static_cast<float>(cell_z + dz) * kRepeat;
+
+                const float ox = px - g_camera.x;
+                const float oy = py - g_camera.y;
+                const float oz = pz - g_camera.z;
+                if (ox * ox + oy * oy + oz * oz > cull_r2)
+                    continue;
+
+                glUniform3f(tu.model_pos, px, py, pz);
+                glDrawElements(
+                    GL_TRIANGLES,
+                    torus_mesh.index_count,
+                    GL_UNSIGNED_INT,
+                    nullptr
+                );
+            }
+
+            glDisable(GL_DEPTH_TEST);
+        }
         else
         {
             glDisable(GL_DEPTH_TEST);
@@ -1798,6 +2020,7 @@ int main(int argc, char** argv)
     delete_mesh(saturn_ring_mesh);
     delete_mesh(uranus_ring_mesh);
     delete_mesh(mbox_mesh);
+    delete_mesh(torus_mesh);
     if (raster_program != 0)
         glDeleteProgram(raster_program);
     if (sky_program != 0)
@@ -1806,6 +2029,10 @@ int main(int argc, char** argv)
         glDeleteProgram(mbox_program);
     if (mbox_sky_program != 0)
         glDeleteProgram(mbox_sky_program);
+    if (torus_program != 0)
+        glDeleteProgram(torus_program);
+    if (torus_sky_program != 0)
+        glDeleteProgram(torus_sky_program);
 
     glfwDestroyWindow(window);
     glfwTerminate();
